@@ -1,0 +1,24 @@
+﻿# ESP32-P4 Ethernet OTA 工具 —— 自定义分区表（16MB Flash）
+#
+# 两个必须注意的前提：
+#   1. 分区表偏移必须是 0x10000（CONFIG_PARTITION_TABLE_OFFSET），不能用默认 0x8000。
+#      P4 的 bootloader 实测 0x6140 = 24896 字节，而 0x8000 偏移下只留 0x6000 = 24576 字节，
+#      构建会直接报：
+#        "Bootloader binary size 0x6140 is too large for partition table offset 0x8000"
+#      开发板自带 ethernet 示例同样用 0x10000，不是随意定的。
+#   2. app 分区起始必须按 0x10000 对齐。
+#
+# 阶段 8 起引入 LVGL 9.5 + esp_lvgl_port，镜像从 389 KB 涨到 2.5~3.5 MB，
+# 原来 3 MB 的 factory 会不够，因此调整为 6 MB，storage 留 8 MB。
+#
+# 布局（分区表本身占 0x10000 ~ 0x11000）：
+#   0x11000   24K   nvs
+#   0x17000    4K   phy_init
+#   0x20000    6M   factory   —— 应用本体（LVGL + UI）
+#   0x620000   8M   storage   —— 固件仓库（导出的待升级固件），阶段 7 使用
+#
+# Name,     Type, SubType, Offset,    Size,      Flags
+nvs,        data, nvs,     0x11000,   0x6000,
+phy_init,   data, phy,     0x17000,   0x1000,
+factory,    app,  factory, 0x20000,   0x600000,
+storage,    data, spiffs,  0x620000,  0x800000,

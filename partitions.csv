@@ -1,0 +1,18 @@
+﻿# ESP32-P4 Ethernet OTA 工具 —— 自定义分区表（16MB Flash，表项位于 0x8000）
+#
+# 为什么要自定义：
+#   IDF 默认 partitions_singleapp.csv 只给 factory 1MB，而 ESP32-P4 链接 esp_eth + lwip
+#   + 系统组件后的镜像普遍在 1.0~1.3MB，链接阶段会直接报 "region flash overflowed" /
+#   "app partition is too small"。
+#
+# 布局：
+#   0x9000   24K   nvs
+#   0xf000    4K   phy_init
+#   0x10000   3M   factory   —— 应用本体，留足后续 LVGL/UI 的余量
+#   0x310000  11M  storage   —— 固件仓库（导入的待升级固件），阶段 7 使用
+#
+# Name,     Type, SubType, Offset,    Size,      Flags
+nvs,        data, nvs,     0x9000,    0x6000,
+phy_init,   data, phy,     0xf000,    0x1000,
+factory,    app,  factory, 0x10000,   0x300000,
+storage,    data, spiffs,  0x310000,  0xB00000,

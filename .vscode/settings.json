@@ -1,0 +1,18 @@
+{
+    "idf.currentSetup": "D:\\esp\\.espressif\\v6.1\\esp-idf",
+    "idf.openOcdConfigs": [
+        "board/esp32p4-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "OPENOCD_USB_ADAPTER_LOCATION": "3-3.4.2",
+        "IDF_TARGET": "esp32p4"
+    },
+    "clangd.path": "C:\\Espressif\\tools\\esp-clangd\\esp-21.1.3_20260408\\esp-clangd\\bin\\clangd.exe",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=c:\\Users\\EL\\Desktop\\ESP32P4\\ESP32P4-colorscaping\\firmware\\build"
+    ],
+    "idf.port": "COM69",
+    "idf.flashType": "UART"
+}

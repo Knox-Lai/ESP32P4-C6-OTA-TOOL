@@ -1,0 +1,20 @@
+dependencies:
+  # IP101 PHY 驱动自 ESP-IDF v6.0 起从 IDF 仓库移出，改为组件管理器分发
+  # 版本与开发板自带 ethernet 示例保持一致
+  espressif/ip101:
+    version: "^1.1.0"
+
+  # ---------------- 阶段 8：显示 / 触摸 / UI ----------------
+  # 版本与开发板自带 lvgl_demo_v9 示例完全一致（已在该板上跑通 lv_demo_widgets）
+  lvgl/lvgl:
+    version: "9.5.0"
+    public: true
+  espressif/esp_lvgl_port:
+    version: "2.8.*"
+    public: true
+  # 7 寸 1024x600 屏的驱动 IC
+  espressif/esp_lcd_jd9165:
+    version: "*"
+  # 电容触摸
+  espressif/esp_lcd_touch_gt911:
+    version: "^1"
