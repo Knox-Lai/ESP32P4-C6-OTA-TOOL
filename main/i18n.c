@@ -115,6 +115,12 @@ static const char *const k_str[I18N_STR_MAX][2] = {
 /* SET_ABOUT         */ { "ABOUT",                                    "关于" },
 /* SET_ABOUT_HINT    */ { "Serial console: type help for commands.   Swipe from the left third of the screen to go back.",
                                                                         "串口控制台输入 help 查看命令。在屏幕左侧三分之一区域内横滑可返回上一页。" },
+
+/* H_SYS_STATUS      */ { "SYSTEM",                                   "系统状态" },
+/* H_CPU             */ { "CPU",                                      "CPU" },
+/* H_MEM             */ { "MEMORY",                                   "内存" },
+/* H_TF              */ { "TF CARD",                                  "TF 卡" },
+/* H_TF_NONE         */ { "not inserted",                             "未插入" },
 };
 /* clang-format on */
 

@@ -39,6 +39,7 @@
 
 #include "app_config.h"
 #include "bsp_display.h"
+#include "bsp_sdcard.h"
 #include "dev_table.h"
 #include "i18n.h"
 #include "net_dhcps.h"
@@ -120,9 +121,23 @@ static lv_obj_t *s_home_ip   = NULL;
 static lv_obj_t *s_home_link = NULL;
 static lv_obj_t *s_home_lease = NULL;
 static lv_obj_t *s_home_heap = NULL;
-static lv_obj_t *s_home_state = NULL;
-static lv_obj_t *s_home_sub   = NULL;
-static lv_obj_t *s_home_bar   = NULL;
+
+/* 桌面右侧"系统状态"卡：CPU 折线 + 内存条 + TF 卡 */
+static lv_obj_t        *s_home_chart   = NULL;
+static lv_chart_series_t *s_home_cpu_ser = NULL;
+static lv_obj_t        *s_home_cpu_pct = NULL;
+static lv_obj_t        *s_home_mem_pct = NULL;
+static lv_obj_t        *s_home_mem_bar = NULL;
+static lv_obj_t        *s_home_tf      = NULL;
+
+/* CPU 采样：每秒一个点，60 点 = 最近 1 分钟。
+ * 环形缓冲留住历史 —— 重建界面（切语言）后折线不会从零开始。 */
+#define CPU_HIST      60
+#define CPU_TASK_MAX  48            /* 任务数上限，uxTaskGetSystemState 的数组长度 */
+static uint8_t   s_cpu_hist[CPU_HIST];
+static uint32_t  s_cpu_hist_n = 0;  /* 累计采样次数，取模得到写入位置 */
+static int       s_cpu_pct    = -1; /* 最近一次算出的 CPU 占用率，-1 = 还没有 */
+static int64_t   s_cpu_next_us = 0; /* 下一次采样的时间戳 */
 
 /* 设备列表 */
 static lv_obj_t *s_dev_list  = NULL;
@@ -181,13 +196,14 @@ static lv_obj_t *s_set_br_val = NULL;   /* 设置页"亮度"行右侧的数值 *
 static int      s_heap_shown     = -1;          /* 桌面空闲内存（8 KB 死区） */
 static int      s_in_mem_shown   = -1;          /* 信息页内部 RAM 占用率 % */
 static int      s_flash_shown    = -1;          /* 信息页 Flash 容量（-1 未读，只读一次） */
-static int      s_bar_shown      = -1;          /* 桌面进度条 */
+static int      s_home_cpu_shown = -1;          /* 桌面 CPU 百分比文字 */
+static int      s_home_mem_shown = -1;          /* 桌面内存条百分比 */
+static int      s_tf_shown       = -2;          /* 桌面 TF 行：-2 未画，-1 无卡，1 有卡 */
 static int      s_arc_shown      = -1;          /* 升级页进度环 */
 static int      s_busy_shown     = -1;          /* 升级按钮显隐 */
 static int      s_lan_key        = -1;          /* 网线图标 (up|dark) */
 static int      s_lan_drawn      = -1;          /* 图标实际画出的状态（-1 未画） */
 static uint32_t s_lan_fg_drawn   = 0;           /* 图标实际画出的颜色 */
-static uint32_t s_home_col_shown = 0xFFFFFFFFu; /* 桌面状态文字色 */
 static uint32_t s_upg_col_shown  = 0xFFFFFFFFu; /* 升级页状态文字色 */
 
 /* ---------------- 基础控件 ---------------- */
@@ -718,6 +734,156 @@ static lv_obj_t *app_tile(lv_obj_t *parent, int x, int y, i18n_str_t label,
     return holder;
 }
 
+/* ---------------- 桌面系统状态：CPU / 内存 / TF 卡 ---------------- */
+
+/* CPU 占用率靠 FreeRTOS 的运行时间统计算：
+ * 打开 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS 后，每个任务都有累计
+ * "占用 CPU 的微秒数"，占用率 = 1 - 空闲任务占比。
+ *
+ * 为什么不用 ulTaskGetIdleRunTimeCounter()：它只统计**调用者所在那个核**的
+ * 空闲时间，双核上只能拿到一半数据。uxTaskGetSystemState 会把所有任务列出来，
+ * 按名字挑出 IDLE0 / IDLE1 一起加，两个核的负载就自然合并成一个数
+ * （分母是所有任务的运行时间之和，也就是两核加起来的总时间）。 */
+static TaskStatus_t s_task_st[CPU_TASK_MAX];
+static uint64_t     s_cpu_idle_last  = 0;
+static uint64_t     s_cpu_total_last = 0;
+static bool         s_cpu_base_ready = false;
+
+static int cpu_load_calc(void)
+{
+    UBaseType_t n = uxTaskGetSystemState(s_task_st, CPU_TASK_MAX, NULL);
+    if (n == 0) {
+        return -1;                 /* 数组太小或调度器还没起来 */
+    }
+
+    uint64_t idle  = 0;
+    uint64_t total = 0;
+    for (UBaseType_t i = 0; i < n; i++) {
+        total += (uint64_t)s_task_st[i].ulRunTimeCounter;
+        if (strncmp(s_task_st[i].pcTaskName, "IDLE", 4) == 0) {
+            idle += (uint64_t)s_task_st[i].ulRunTimeCounter;
+        }
+    }
+
+    if (!s_cpu_base_ready) {       /* 第一次只能建基线：差值要下一次才有 */
+        s_cpu_base_ready = true;
+        s_cpu_idle_last  = idle;
+        s_cpu_total_last = total;
+        return -1;
+    }
+
+    const uint64_t dt = total - s_cpu_total_last;
+    const uint64_t di = idle - s_cpu_idle_last;
+    s_cpu_total_last = total;
+    s_cpu_idle_last  = idle;
+
+    if (dt == 0 || di > dt) {      /* 有任务被删掉时会这样，这一次不算数 */
+        return -1;
+    }
+
+    int load = (int)(100u - (unsigned)((di * 100u) / dt));
+    return load < 0 ? 0 : (load > 100 ? 100 : load);
+}
+
+/* 把环形缓冲里的历史灌回折线：不足 60 点的部分补 0，
+ * 于是刚开机时折线从左边空白处慢慢长出来，而不是一上来就满屏。 */
+static void home_chart_seed(void)
+{
+    if (s_home_chart == NULL || s_home_cpu_ser == NULL) {
+        return;
+    }
+
+    const uint32_t cnt = s_cpu_hist_n < CPU_HIST ? s_cpu_hist_n : CPU_HIST;
+    for (uint32_t i = cnt; i < CPU_HIST; i++) {
+        lv_chart_set_next_value(s_home_chart, s_home_cpu_ser, 0);
+    }
+    for (uint32_t i = 0; i < cnt; i++) {
+        const uint32_t idx = (s_cpu_hist_n - cnt + i) % CPU_HIST;
+        lv_chart_set_next_value(s_home_chart, s_home_cpu_ser, s_cpu_hist[idx]);
+    }
+}
+
+/* 内部 RAM 占用率。口径与信息页一致：默认堆里并了 32 MB PSRAM，
+ * 按默认堆算永远是两位数以下，看不出运行时压力。 */
+static int mem_used_pct(void)
+{
+    const size_t total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t fre   = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (total == 0) {
+        return -1;
+    }
+    return (int)(((total - fre) * 100u) / total);
+}
+
+/* 容量格式化：大卡用 GB 一位小数，小卡用 MB 整数 */
+static void fmt_cap(char *buf, size_t n, uint64_t used_kb, uint64_t total_kb)
+{
+    if (total_kb >= 1024u * 1024u) {
+        const unsigned u10 = (unsigned)(used_kb * 10u / (1024u * 1024u));
+        const unsigned t10 = (unsigned)(total_kb * 10u / (1024u * 1024u));
+        snprintf(buf, n, "%u.%u / %u.%u GB", u10 / 10u, u10 % 10u, t10 / 10u, t10 % 10u);
+    } else {
+        snprintf(buf, n, "%u / %u MB",
+                 (unsigned)(used_kb / 1024u), (unsigned)(total_kb / 1024u));
+    }
+}
+
+/* 每 400 ms 调一次的刷新；CPU 走 1 s 节拍，文字都带死区。 */
+static void home_stat_update(int64_t now_us)
+{
+    /* ---- CPU：1 s 一个采样点，和页面无关（离开桌面也保持历史连续） ---- */
+    if (now_us >= s_cpu_next_us) {
+        s_cpu_next_us = now_us + 1000000;
+
+        const int load = cpu_load_calc();
+        if (load >= 0) {
+            s_cpu_pct = load;
+            s_cpu_hist[s_cpu_hist_n % CPU_HIST] = (uint8_t)load;
+            s_cpu_hist_n++;
+
+            /* 页面不可见时 invalidate 会被 LVGL 直接丢掉，写它没有代价 */
+            if (s_home_chart != NULL && s_home_cpu_ser != NULL) {
+                lv_chart_set_next_value(s_home_chart, s_home_cpu_ser, load);
+            }
+        }
+    }
+
+    if (s_cur != APP_HOME) {
+        return;                     /* 看不见就不写文字，省掉重排 */
+    }
+
+    /* ---- CPU 百分比：整数变了才写 ---- */
+    if (s_cpu_pct >= 0 && s_cpu_pct != s_home_cpu_shown) {
+        s_home_cpu_shown = s_cpu_pct;
+        set_txt_fmt(s_home_cpu_pct, "CPU %d%%", s_cpu_pct);
+    }
+
+    /* ---- 内存：2% 死区（内部 RAM 的 1% ≈ 4 KB，稳态下进度条不重绘） ---- */
+    const int mp = mem_used_pct();
+    if (mp >= 0 && (s_home_mem_shown < 0 || abs(mp - s_home_mem_shown) >= 2)) {
+        s_home_mem_shown = mp;
+        set_txt_fmt(s_home_mem_pct, "%d%%", mp);
+        lv_bar_set_value(s_home_mem_bar, mp, LV_ANIM_OFF);
+    }
+
+    /* ---- TF 卡：只读 bsp_sdcard 的缓存，不碰文件系统 ---- */
+    uint64_t tk = 0;
+    uint64_t fk = 0;
+    if (bsp_sdcard_usage(&tk, &fk)) {
+        char cap[40];
+        fmt_cap(cap, sizeof(cap), tk > fk ? tk - fk : 0, tk);
+        set_txt(s_home_tf, cap);              /* set_txt 自带判重 */
+        if (s_tf_shown != 1) {
+            s_tf_shown = 1;
+            lv_obj_set_style_text_color(s_home_tf, lv_color_hex(C_TXT), LV_PART_MAIN);
+        }
+    } else if (s_tf_shown != -1) {
+        s_tf_shown = -1;
+        set_txt(s_home_tf, i18n_t(H_TF_NONE));
+        lv_obj_set_style_text_color(s_home_tf, lv_color_hex(C_SUB), LV_PART_MAIN);
+    }
+}
+
 static void build_home(lv_obj_t *page)
 {
     /* 状态栏不在这里建：它是全局的（s_sb），浮在所有页之上，见 build_status_bar() */
@@ -742,25 +908,64 @@ static void build_home(lv_obj_t *page)
     s_home_heap = text(c1, "0 KB", UI_F_SMALL, C_TXT, 0, 172);
     lv_obj_align(s_home_heap, LV_ALIGN_TOP_RIGHT, -24, 172);
 
-    /* ---- 右：会话 widget ---- */
+    /* ---- 右：系统状态（CPU 折线 / 内存 / TF 卡） ----
+     * 这里原来显示"上次升级"的进度，但升级进度在升级页里更清楚，
+     * 桌面这块位置用来当运行状态看板更有用。
+     *
+     * 卡片用实底而不是像左边那样 80% 半透明：折线每秒都要重绘一次，
+     * 半透明意味着每次都要把下面的渐变壁纸重新合成一遍 —— 那正是
+     * "主页一直闪"的老原因。实底只填一层纯白，重绘代价低得多。 */
     lv_obj_t *c2 = card(page, 526, 56, 466, 236, 24);
-    lv_obj_set_style_bg_opa(c2, LV_OPA_80, LV_PART_MAIN);
     lv_obj_set_style_border_width(c2, 0, LV_PART_MAIN);
 
-    text(c2, i18n_t(H_LAST_SESSION), UI_F_SMALL, C_SUB, 24, 20);
-    s_home_state = text(c2, i18n_t(ST_IDLE), UI_F_LARGE, C_TXT, 24, 42);
-    s_home_sub = text(c2, i18n_t(H_NO_SESSION), UI_F_SMALL, C_SUB, 24, 84);
+    text(c2, i18n_t(H_SYS_STATUS), UI_F_SMALL, C_SUB, 24, 16);
+    s_home_cpu_pct = text(c2, "--", UI_F_SMALL, C_BLUE, 0, 16);
+    lv_obj_align(s_home_cpu_pct, LV_ALIGN_TOP_RIGHT, -24, 16);
 
-    s_home_bar = lv_bar_create(c2);
-    lv_obj_remove_flag(s_home_bar, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_pos(s_home_bar, 24, 124);
-    lv_obj_set_size(s_home_bar, 418, 10);
-    lv_bar_set_range(s_home_bar, 0, 100);
-    lv_bar_set_value(s_home_bar, 0, LV_ANIM_OFF);
-    lv_obj_set_style_radius(s_home_bar, 5, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_home_bar, lv_color_hex(0xE9E9EE), LV_PART_MAIN);
-    lv_obj_set_style_radius(s_home_bar, 5, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_home_bar, lv_color_hex(C_BLUE), LV_PART_INDICATOR);
+    /* CPU 折线：60 点 = 最近 1 分钟，纵轴固定 0~100，只画线不画点 */
+    lv_obj_t *ch = lv_chart_create(c2);
+    lv_obj_remove_flag(ch, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(ch, LV_OBJ_FLAG_SCROLLABLE);   /* 折线不该跟着手指滚 */
+    lv_obj_set_pos(ch, 24, 44);
+    lv_obj_set_size(ch, 418, 92);
+    lv_obj_set_style_bg_opa(ch, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(ch, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(ch, 0, LV_PART_MAIN);
+    lv_obj_set_style_line_width(ch, 1, LV_PART_MAIN);        /* 横向分隔线 */
+    lv_obj_set_style_line_color(ch, lv_color_hex(0xEFEFF3), LV_PART_MAIN);
+    lv_obj_set_style_line_width(ch, 2, LV_PART_ITEMS);        /* 折线本身 */
+    lv_obj_set_style_width(ch, 0, LV_PART_INDICATOR);         /* 0 = 不画数据点 */
+    lv_obj_set_style_height(ch, 0, LV_PART_INDICATOR);
+    lv_chart_set_type(ch, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(ch, CPU_HIST);
+    lv_chart_set_axis_range(ch, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+    lv_chart_set_div_line_count(ch, 2, 0);
+    s_home_cpu_ser = lv_chart_add_series(ch, lv_color_hex(C_BLUE), LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_all_values(ch, s_home_cpu_ser, 0);
+    s_home_chart = ch;
+    home_chart_seed();          /* 把环形缓冲里的历史灌回去 */
+
+    /* 内存行：标签 + 细进度条 + 右侧百分比 */
+    text(c2, i18n_t(H_MEM), UI_F_SMALL, C_SUB, 24, 148);
+
+    s_home_mem_bar = lv_bar_create(c2);
+    lv_obj_remove_flag(s_home_mem_bar, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_pos(s_home_mem_bar, 78, 154);
+    lv_obj_set_size(s_home_mem_bar, 300, 8);
+    lv_bar_set_range(s_home_mem_bar, 0, 100);
+    lv_bar_set_value(s_home_mem_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_radius(s_home_mem_bar, 4, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_home_mem_bar, lv_color_hex(0xE9E9EE), LV_PART_MAIN);
+    lv_obj_set_style_radius(s_home_mem_bar, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_home_mem_bar, lv_color_hex(C_BLUE), LV_PART_INDICATOR);
+
+    s_home_mem_pct = text(c2, "--", UI_F_SMALL, C_TXT, 0, 148);
+    lv_obj_align(s_home_mem_pct, LV_ALIGN_TOP_RIGHT, -24, 148);
+
+    /* TF 卡行：只读缓存，不碰文件系统（f_getfree 要遍历 FAT，会卡 LVGL 任务） */
+    text(c2, i18n_t(H_TF), UI_F_SMALL, C_SUB, 24, 190);
+    s_home_tf = text(c2, i18n_t(H_TF_NONE), UI_F_SMALL, C_SUB, 0, 190);
+    lv_obj_align(s_home_tf, LV_ALIGN_TOP_RIGHT, -24, 190);
 
     /* ---- 图标网格：4 个居中排布，4*96 + 3*32 = 480，(1024-480)/2 = 272 ---- */
     app_tile(page, 272, 322, A_DEVICES,  0xEAF3FF, 0xD4E6FF, 0x1A63C8, ICO_DEVICES,  APP_DEVICES);
@@ -1654,19 +1859,23 @@ static void refresh_cb(lv_timer_t *t)
 {
     (void)t;
 
-    /* 刷新统计：只在"这段时间真的刷过"时才打一行，静止（0 次）完全静默，
-     * 不破坏"日志只在异常/连接变化时输出"的约定。 */
+    /* 刷新统计：只在"明显超过正常刷新量"时才打一行，不破坏
+     * "日志只在异常/连接变化时输出"的约定。
+     *
+     * 阈值 30 次/10 s 的来历：桌面那张 CPU 折线每秒推一个点，
+     * 自带约 10 次/10 s 的刷新，属于正常。超过 3 fps 的重绘才值得看一眼
+     * —— 那通常意味着有对象在被反复 invalidate。 */
     static int64_t s_flush_log_us = 0;
     int64_t now_us = esp_timer_get_time();
     if (s_flush_log_us == 0) {
         s_flush_log_us = now_us;
     } else if (now_us - s_flush_log_us >= 10000000) {
-        if (s_flush_cnt > 0) {
+        if (s_flush_cnt >= 30) {
             ESP_LOGI(TAG, "10 s 内刷新 %u 次，最近区域 (%d,%d)-(%d,%d)",
                      (unsigned)s_flush_cnt, (int)s_flush_x1, (int)s_flush_y1,
                      (int)s_flush_x2, (int)s_flush_y2);
-            s_flush_cnt = 0;
         }
+        s_flush_cnt = 0;
         s_flush_log_us = now_us;
     }
 
@@ -1759,29 +1968,12 @@ static void refresh_cb(lv_timer_t *t)
             s_heap_shown = (int)heap_kb;
             set_txt_fmt(s_home_heap, "%u KB", heap_kb);
         }
-
-        set_txt(s_home_state, state_txt(st.state));
-
-        /* 颜色只在真的换了才设：set_style 本身也会 invalidate */
-        uint32_t sc_now = state_color(st.state);
-        if (sc_now != s_home_col_shown) {
-            s_home_col_shown = sc_now;
-            lv_obj_set_style_text_color(s_home_state, lv_color_hex(sc_now), LV_PART_MAIN);
-        }
-
-        if (st.state == OTA_STATE_IDLE) {
-            set_txt(s_home_sub, i18n_t(H_NO_SESSION));
-        } else {
-            set_txt_fmt(s_home_sub, "%u%%   %u / %u KB   %u ms",
-                        pct, (unsigned)(st.acked / 1024), (unsigned)(st.total / 1024),
-                        (unsigned)st.elapsed_ms);
-        }
-
-        if ((int)pct != s_bar_shown) {
-            s_bar_shown = (int)pct;
-            lv_bar_set_value(s_home_bar, (int32_t)pct, LV_ANIM_OFF);
-        }
     }
+
+    /* ---- 桌面右侧系统状态（CPU / 内存 / TF） ----
+     * 放在页面判断外面：CPU 要 1 s 一个采样点，离开桌面也得继续采，
+     * 否则从别的页面回来折线上就是一段空白。 */
+    home_stat_update(now_us);
 
     /* ---- 设备列表 ---- */
     dev_entry_t snap[APP_DEV_MAX];
@@ -2094,14 +2286,19 @@ static void ui_app_rebuild(void)
     s_in_mem_shown   = -1;
     s_flash_shown    = -1;
     s_fps_shown      = -1;      /* 帧率 label 是新对象，下次 tick 必须重写 */
-    s_bar_shown      = -1;
     s_arc_shown      = -1;
     s_busy_shown     = -1;
     s_lan_key        = -1;
     s_lan_drawn      = -1;      /* 图标是新建的对象，必须重画一次 */
     s_lan_fg_drawn   = 0;
-    s_home_col_shown = 0xFFFFFFFFu;
     s_upg_col_shown  = 0xFFFFFFFFu;
+
+    /* 桌面系统状态：新 label/折线都是新对象，
+     * CPU 文字与 TF 行必须重写；折线的历史由 build_home 里的 seed 灌回去，
+     * 所以环形缓冲 s_cpu_hist 不能清。 */
+    s_home_cpu_shown = -1;
+    s_home_mem_shown = -1;
+    s_tf_shown       = -2;
 
     /* 这三个是新页面里的新对象，旧指针必须清掉：
      * rebuild 期间若 400 ms 定时器或滑块回调进来，写旧对象就是野指针；
@@ -2109,6 +2306,14 @@ static void ui_app_rebuild(void)
     s_br_slider  = NULL;
     s_br_pct     = NULL;
     s_set_br_val = NULL;
+
+    /* 桌面系统状态的对象也会被 lv_obj_clean 删掉 */
+    s_home_chart   = NULL;
+    s_home_cpu_ser = NULL;
+    s_home_cpu_pct = NULL;
+    s_home_mem_pct = NULL;
+    s_home_mem_bar = NULL;
+    s_home_tf      = NULL;
 
     lv_obj_clean(lv_screen_active());
     build_all();

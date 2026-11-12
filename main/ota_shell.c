@@ -35,6 +35,7 @@
 
 #include "app_config.h"
 #include "bsp_display.h"
+#include "bsp_sdcard.h"
 #include "dev_table.h"
 #include "ota_client.h"
 #include "ota_image.h"
@@ -75,6 +76,8 @@ static void print_help(void)
            "  disp timing reset\r\n"
            "                  回到编译期默认时序\r\n"
            "  bl dc on|off    背光脱离 PWM 恒亮 / 恢复调光\r\n"
+           "  sd              TF 卡状态与容量（没插卡显示未挂载）\r\n"
+           "  sd mount        立即重试挂载\r\n"
            "  lcd w <cmd> [b...]\r\n"
            "                  直接写面板寄存器（十六进制），如 lcd w C0 12\r\n"
            "\r\n", APP_OTA_SYNTH_SIZE_KB);
@@ -297,6 +300,44 @@ static void cmd_time(int argc, char **argv)
     printf("\r\n[时间] 已设置：%s\r\n\r\n", buf);
 }
 
+/* ---------------- TF 卡 ---------------- */
+
+/* sd          当前状态（挂载点 / 容量）
+ * sd mount    立即重试挂载（刚插卡不想等后台 3 s 轮询时用）
+ */
+static void cmd_sd(int argc, char **argv)
+{
+    if (argc >= 1 && strcmp(argv[0], "mount") == 0) {
+        esp_err_t err = bsp_sdcard_mount_now();
+        if (err != ESP_OK) {
+            printf("\r\n[TF] 挂载失败：%s\r\n"
+                   "     常见原因：没插卡 / 不是 FAT32 / 卡座接触不良\r\n\r\n",
+                   esp_err_to_name(err));
+            return;
+        }
+    }
+
+    if (!bsp_sdcard_mounted()) {
+        printf("\r\n[TF] 未挂载（没插卡）\r\n\r\n");
+        return;
+    }
+
+    uint64_t tk = 0;
+    uint64_t fk = 0;
+    if (!bsp_sdcard_usage(&tk, &fk)) {
+        printf("\r\n[TF] 已挂载 %s，容量还没读出来（等下一次刷新）\r\n\r\n",
+               BSP_SD_MOUNT_POINT);
+        return;
+    }
+
+    const uint64_t used = tk > fk ? tk - fk : 0;
+    printf("\r\n[TF] %s  已用 %u.%u / %u.%u GB，剩余 %u MB\r\n\r\n",
+           BSP_SD_MOUNT_POINT,
+           (unsigned)(used / 1048576u), (unsigned)((used % 1048576u) * 10u / 1048576u),
+           (unsigned)(tk / 1048576u), (unsigned)((tk % 1048576u) * 10u / 1048576u),
+           (unsigned)(fk / 1024u));
+}
+
 /* ---------------- 显示诊断（闪屏定位用） ---------------- */
 
 /* disp                     打印 VSYNC / 整帧计数
@@ -492,6 +533,8 @@ static void handle_line(char *line)
         cmd_time(argc, argv);
     } else if (strcmp(cmd, "disp") == 0) {
         cmd_disp(argc, argv);
+    } else if (strcmp(cmd, "sd") == 0) {
+        cmd_sd(argc, argv);
     } else if (strcmp(cmd, "bl") == 0) {
         cmd_bl(argc, argv);
     } else if (strcmp(cmd, "lcd") == 0) {

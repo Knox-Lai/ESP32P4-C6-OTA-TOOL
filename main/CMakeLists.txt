@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "app_main.c"
+    SRCS "bsp_sdcard.c" "app_main.c"
          "net_eth.c"
          "net_dhcps.c"
          "ota_frame.c"
@@ -11,6 +11,7 @@ idf_component_register(
          "dev_table.c"
          "dev_discovery.c"
          "bsp_display.c"
+         "bsp_sdcard.c"
          "ui_app.c"
          "i18n.c"
          "sys_clock.c"
@@ -49,9 +50,13 @@ idf_component_register(
     # IDF 6.x 是 mbedtls 4.x，`mbedtls/sha256.h` 已删除，只剩 PSA 一套，
     # 为一个整包摘要去初始化 PSA 不值得，也会把组件依赖面扩大。
     # spi_flash：esp_flash_get_size() 读本机 Flash 实际容量（信息页显示）
+    # 阶段 9 TF 卡（bsp_sdcard.c）：
+    #   esp_driver_sdmmc : SDMMC 主机驱动（SDMMC_HOST_DEFAULT / 槽位配置）
+    #   sdmmc            : sd_pwr_ctrl_by_on_chip_ldo.h（片内 LDO 给卡供电）
+    #   fatfs            : esp_vfs_fat_sdmmc_mount / esp_vfs_fat_info
     REQUIRES esp_eth esp_netif esp_event lwip esp_timer esp_driver_uart
              esp_driver_usb_serial_jtag esp_common log freertos nvs_flash
              esp_lcd esp_lcd_jd9165 esp_lcd_touch esp_lcd_touch_gt911
              esp_lvgl_port lvgl esp_driver_ledc esp_driver_i2c esp_hw_support
-             spi_flash
+             spi_flash esp_driver_sdmmc sdmmc fatfs
 )

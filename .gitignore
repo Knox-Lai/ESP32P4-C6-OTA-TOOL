@@ -1,0 +1,13 @@
+# ---- 构建产物 ----
+build/
+
+# ---- 日志 ----
+*.log
+
+# ---- sdkconfig 备份 ----
+sdkconfig.old
+sdkconfig.*.bak
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+Thumbs.db

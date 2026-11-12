@@ -129,6 +129,15 @@ typedef enum {
     SET_ABOUT,
     SET_ABOUT_HINT,
 
+    /* 桌面"系统状态"卡（CPU 折线 / 内存 / TF 卡）
+     * 追加在末尾而不是插进"桌面"那一段：枚举整体后移会让 i18n.c 的
+     * 顺序表全部错位，而这些 ID 没有顺序上的意义。 */
+    H_SYS_STATUS,
+    H_CPU,
+    H_MEM,
+    H_TF,
+    H_TF_NONE,
+
     I18N_STR_MAX
 } i18n_str_t;
 

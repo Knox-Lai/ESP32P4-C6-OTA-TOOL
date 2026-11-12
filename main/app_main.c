@@ -33,6 +33,7 @@
 #include "ota_client.h"
 #include "ota_shell.h"
 #include "bsp_display.h"
+#include "bsp_sdcard.h"
 #include "sys_clock.h"
 #include "ui_app.h"
 
@@ -203,6 +204,10 @@ void app_main(void)
     /* 0) 系统时钟：无 RTC / 无网络，用编译时间做初值，串口 time set 校正。
      *    必须在 UI 之前，状态栏一建出来就要有值。 */
     sys_clock_init();
+
+    /* 0.5) TF 卡：后台任务异步挂载，不阻塞启动。
+     *      放这里是为了让桌面第一帧就有机会读到卡状态（没插就显示"未插入"）。 */
+    bsp_sdcard_init();
 
     /* 1) 建 netif（带 ESP_NETIF_DHCP_SERVER 标志）与驱动 */
     ESP_ERROR_CHECK(net_eth_init());
