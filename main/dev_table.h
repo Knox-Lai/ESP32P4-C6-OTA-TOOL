@@ -17,6 +17,8 @@
 
 #include "esp_err.h"
 
+#include "dev_model.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,6 +50,7 @@ typedef struct {
     uint32_t ip;                        /* 网络字节序，可直接用于 sockaddr_in */
     char     hostname[33];              /* DHCP 上报的主机名，可能为空 */
     dev_identity_t id;
+    fw_model_t model_id;                /* 白名单匹配结果，apply_identity 时算一次（不参与线上格式） */
     uint32_t first_seen_ms;
     uint32_t last_seen_ms;              /* 最后一次收到应答的时刻 */
     uint32_t next_poll_ms;
@@ -62,6 +65,12 @@ void dev_table_clear(void);
 
 /** @brief 已用槽位数 */
 int dev_table_count(void);
+
+/** @brief 当前在线的 OTA 设备台数（已识别 + 心跳正常），桌面"设备"卡片用 */
+int dev_table_online_count(void);
+
+/** @brief 已识别但心跳断了的台数（真掉线），桌面卡片右上角提示用 */
+int dev_table_offline_count(void);
 
 /* ---------- 查找（返回静态数组内指针，生命周期 = 程序运行期；字段值可能被其它任务改） ---------- */
 

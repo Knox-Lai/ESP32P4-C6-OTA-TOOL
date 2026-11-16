@@ -1,6 +1,6 @@
 @font-face {
   font-family: "iconfont"; /* Project id  */
-  src: url('iconfont.ttf?t=1793925042751') format('truetype');
+  src: url('iconfont.ttf?t=1794816089745') format('truetype');
 }
 
 .iconfont {
@@ -51,6 +51,10 @@
   content: "\e7d9";
 }
 
+.icon-wifi:before {
+  content: "\e7e0";
+}
+
 .icon-disconnect:before {
   content: "\e7e1";
 }
@@ -85,5 +89,21 @@
 
 .icon-setting:before {
   content: "\e6f0";
+}
+
+.icon-a-wifixinhaoqiangdu1:before {
+  content: "\e646";
+}
+
+.icon-a-wifixinhaoqiangdu2:before {
+  content: "\e647";
+}
+
+.icon-a-wifixinhaoqiangdu3:before {
+  content: "\e648";
+}
+
+.icon-a-wifixinhaoqiangdu4:before {
+  content: "\e649";
 }
 

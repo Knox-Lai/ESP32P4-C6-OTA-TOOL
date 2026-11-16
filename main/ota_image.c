@@ -3,6 +3,7 @@
  * @brief 合成镜像实现：字节由绝对偏移确定性生成，可随机访问、可复现
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_check.h"
@@ -104,4 +105,90 @@ void ota_image_log(const ota_image_t *img)
              img->sha256[0], img->sha256[1], img->sha256[2], img->sha256[3],
              img->sha256[4], img->sha256[5], img->sha256[6], img->sha256[7],
              img->sha256[28], img->sha256[29], img->sha256[30], img->sha256[31]);
+}
+
+/* ---------------- 真实文件源 ---------------- */
+
+typedef struct {
+    FILE *f;
+} file_ctx_t;
+
+static esp_err_t file_read(ota_image_t *img, uint32_t offset, void *buf, uint32_t len)
+{
+    if (img == NULL || buf == NULL || img->ctx == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    file_ctx_t *c = (file_ctx_t *)img->ctx;
+    if (c->f == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (offset > img->size || len > img->size - offset) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (fseek(c->f, (long)(FW_PKG_HDR_LEN + offset), SEEK_SET) != 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 短读 = 卡被拔了 / 文件被截断。返回错误让会话正常失败，而不是读出一片垃圾。 */
+    if (fread(buf, 1, len, c->f) != len) {
+        ESP_LOGW(TAG, "读文件失败（偏移 %u，%u 字节）", (unsigned)offset, (unsigned)len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+
+static void file_release(ota_image_t *img)
+{
+    if (img == NULL || img->ctx == NULL) {
+        return;
+    }
+    file_ctx_t *c = (file_ctx_t *)img->ctx;
+    if (c->f != NULL) {
+        fclose(c->f);
+        c->f = NULL;
+    }
+    free(c);
+    img->ctx     = NULL;
+    img->read    = NULL;
+    img->release = NULL;
+}
+
+esp_err_t ota_image_from_file(ota_image_t *img, const fw_pkg_hdr_t *h, const char *path)
+{
+    ESP_RETURN_ON_FALSE(img != NULL && h != NULL && path != NULL,
+                        ESP_ERR_INVALID_ARG, TAG, "参数为空");
+
+    memset(img, 0, sizeof(*img));
+
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "打不开 %s", path);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    file_ctx_t *c = calloc(1, sizeof(*c));
+    if (c == NULL) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+    c->f = f;
+
+    strncpy(img->model, h->model, DEV_MODEL_LEN);
+    img->model[DEV_MODEL_LEN] = '\0';
+    img->hw_min  = h->hw_min;
+    img->hw_max  = h->hw_max;
+    img->fw_ver  = h->fw_ver;
+    img->size    = h->payload_len;
+    img->crc32   = h->payload_crc32;
+    memcpy(img->sha256, h->sha256, sizeof(img->sha256));
+
+    const char *base = strrchr(path, '/');
+    snprintf(img->name, sizeof(img->name), "%s", (base != NULL) ? base + 1 : path);
+
+    img->read    = file_read;
+    img->ctx     = c;
+    img->release = file_release;
+
+    ESP_LOGI(TAG, "镜像来自文件 '%s'  fw=%s  %u KB",
+             img->name, ota_fw_ver_str(img->fw_ver), (unsigned)(img->size / 1024u));
+    return ESP_OK;
 }

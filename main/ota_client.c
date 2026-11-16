@@ -733,6 +733,11 @@ static void ota_task(void *arg)
 
     status_finish(err == ESP_OK, s->err, msg);
 
+    /* 文件源在这里关句柄（合成镜像的 release 是 NULL，不需要 if 之外的判断） */
+    if (s->img.release != NULL) {
+        s->img.release(&s->img);
+    }
+
     free(s);
     s_busy = false;
     vTaskDelete(NULL);

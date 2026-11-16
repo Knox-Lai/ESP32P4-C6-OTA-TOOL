@@ -18,3 +18,18 @@ dependencies:
   # 电容触摸
   espressif/esp_lcd_touch_gt911:
     version: "^1"
+
+  # ---------------- WiFi（ESP32-P4 没有射频，靠板载 C6 经 SDIO 提供） ----------------
+  # esp_hosted 负责 SDIO 传输层 + C6 侧 slave 固件构建规则，
+  # esp_wifi_remote 把标准 esp_wifi_* 调用转发给 C6 —— 上层代码不需要区分本地/远程。
+  # 版本取自开发板配套的 xiaozhi-esp32 工程（同一块 P4V3 板，已验证 WiFi 可用）。
+  # 关键 sdkconfig：CONFIG_SLAVE_IDF_TARGET_ESP32C6=y（见 sdkconfig.defaults），
+  # 默认引脚 CLK=18 CMD=19 D0~D3=14~17 RESET=54，与本板 C6 连线一致。
+  espressif/esp_hosted:
+    version: "^3.0.7"
+    rules:
+    - if: target in [esp32p4]
+  espressif/esp_wifi_remote:
+    version: "^1.6.4"
+    rules:
+    - if: target in [esp32p4]

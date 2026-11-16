@@ -180,6 +180,40 @@ int dev_table_count(void)
     return n;
 }
 
+int dev_table_online_count(void)
+{
+    /* 只数「已识别 + 在线」。
+     *
+     * 表里还有两类条目不能算进来：
+     *   ① 拿到 DHCP 租约但从不响应发现协议的主机（PC / 手机 / 打印机）——
+     *      它们 3 s 后就会 online=false，但条目会一直留着（10 s 慢探一次）；
+     *   ② 真设备掉线后的旧记录。
+     * 之前这里只判 online，结果"共 N 台"恒大于实际台数，用户看不懂。 */
+    int n = 0;
+    lock();
+    for (int i = 0; i < APP_DEV_MAX; i++) {
+        if (s_table[i].used && s_table[i].identified && s_table[i].online) {
+            n++;
+        }
+    }
+    unlock();
+    return n;
+}
+
+int dev_table_offline_count(void)
+{
+    /* 已识别但心跳断了 —— 这是唯一值得提醒的"掉线"，卡片右上角用 */
+    int n = 0;
+    lock();
+    for (int i = 0; i < APP_DEV_MAX; i++) {
+        if (s_table[i].used && s_table[i].identified && !s_table[i].online) {
+            n++;
+        }
+    }
+    unlock();
+    return n;
+}
+
 dev_entry_t *dev_table_find_mac(const uint8_t mac[6])
 {
     lock();
@@ -273,6 +307,7 @@ void dev_table_apply_identity(dev_entry_t *e, const dev_identity_t *id, uint32_t
         ESP_LOGW(TAG, "IP %08" PRIx32 " 上的设备已更换（UID 变化），刷新身份", e->ip);
     }
     e->id = *id;
+    e->model_id = dev_model_match(id->model);   /* 只算一次，UI/匹配都用它 */
     e->identified = true;
     e->online = true;
     e->miss = 0;

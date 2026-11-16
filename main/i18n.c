@@ -46,13 +46,13 @@ static const char *const k_str[I18N_STR_MAX][2] = {
 /* A_INFO            */ { "Info",                                     "信息" },
 /* A_SETTINGS        */ { "Settings",                                 "设置" },
 
-/* H_NETWORK         */ { "NETWORK",                                  "网络" },
+/* H_NETWORK         */ { "ETHERNET",                                 "以太网" },
 /* H_LINK            */ { "LINK",                                     "链路" },
 /* H_DHCP_LEASE      */ { "ASSIGNED IP",                              "已分配 IP" },
 /* H_FREE_HEAP       */ { "FREE HEAP",                                "空闲内存" },
 /* H_LAST_SESSION    */ { "LAST SESSION",                             "上次升级" },
 /* H_NO_SESSION      */ { "no session yet",                           "尚未开始" },
-/* H_TAGLINE         */ { "Ethernet OTA Upgrader",                    "以太网 OTA 升级工具" },
+/* H_TAGLINE         */ { "Ethernet + Wi-Fi",                        "以太网 + WiFi" },
 
 /* D_TITLE           */ { "Devices",                                  "设备" },
 /* D_FW              */ { "fw %u.%u.%u.%u",                           "固件 %u.%u.%u.%u" },
@@ -121,6 +121,52 @@ static const char *const k_str[I18N_STR_MAX][2] = {
 /* H_MEM             */ { "MEMORY",                                   "内存" },
 /* H_TF              */ { "TF CARD",                                  "TF 卡" },
 /* H_TF_NONE         */ { "not inserted",                             "未插入" },
+
+/* SET_NETWORK       */ { "NETWORK",                                  "网络" },
+/* W_WIFI            */ { "WiFi",                                     "WiFi" },
+/* W_AVAILABLE       */ { "AVAILABLE NETWORKS",                       "可用网络" },
+/* W_ON              */ { "On",                                       "开启" },
+/* W_OFF             */ { "Off",                                      "关闭" },
+/* W_SCANNING        */ { "Scanning...",                              "扫描中…" },
+/* W_CONNECTING      */ { "Connecting...",                            "连接中…" },
+/* W_CONNECTED       */ { "Connected",                                "已连接" },
+/* W_NOT_CONNECTED   */ { "Not connected",                            "未连接" },
+/* W_FAILED          */ { "Failed",                                   "连接失败" },
+/* W_UNAVAILABLE     */ { "Unavailable",                              "不可用" },
+/* W_OPEN            */ { "Open",                                     "开放网络" },
+/* W_PASSWORD        */ { "PASSWORD",                                 "密码" },
+/* W_CONNECT         */ { "Connect",                                  "连接" },
+/* W_CANCEL          */ { "Cancel",                                   "取消" },
+/* W_DISCONNECT      */ { "Disconnect",                               "断开" },
+/* W_FORGET          */ { "Forget",                                   "忘记" },
+/* W_HINT            */ { "Tap a network to connect.  Saved networks reconnect at power-on.   Wi-Fi is the uplink for firmware downloads; the Ethernet port keeps running its own DHCP server.",
+                                                                        "点击网络名称连接；已保存的网络开机会自动重连。WiFi 用于从服务器下载固件，网口上的 DHCP 服务不受影响。" },
+/* W_NO_AP           */ { "No network found.  Scan again.",            "未发现网络，请重新扫描。" },
+/* W_SAVED           */ { "saved",                                    "已保存" },
+/* W_SCAN            */ { "Scan",                                     "扫描" },
+/* W_KNOWN           */ { "KNOWN NETWORKS",                           "已知网络" },
+/* W_OTHER           */ { "OTHER NETWORKS",                           "其他网络" },
+/* W_RETRYING        */ { "Retrying...",                              "正在重试…" },
+
+/* 桌面右侧"设备"卡片：大字只数「已识别且在线」的 OTA 设备 */
+/* H_DEVICES         */ { "DEVICES",                                  "设备" },
+/* H_DEV_ONLINE      */ { "ONLINE",                                   "在线" },
+/* H_DEV_OFFLINE_FMT */ { "%u offline",                               "%u 台离线" },
+
+/* ---- WiFi 失败原因（net_wifi_err_t → 界面文案，追加在末尾） ----
+ * 目标是把"failed"换成用户能据此动手的一句话。文案长度要能塞进
+ * WiFi 子页那条 712 px 的状态行（16 px 字号约 40 个汉字位），
+ * 所以不写"请检查密码是否输入正确"这种长句，只留结论。 */
+/* W_ERR_PASSWORD    */ { "Wrong password",                            "密码错误" },
+/* W_ERR_NO_AP       */ { "Network not found",                          "找不到该 AP" },
+/* W_ERR_REJECTED    */ { "AP refused",                                 "AP 拒绝连接" },
+/* W_ERR_TIMEOUT     */ { "Timed out",                                  "连接超时" },
+/* W_ERR_LINK_LOST   */ { "Connection lost",                            "连接中断" },
+/* W_RETRY_REASON_FMT*/ { "%s, retrying...",                            "%s，正在重试…" },
+/* W_ERR_STOPPED_FMT */ { "%s, stopped retrying",                       "%s，已停止重试" },
+
+/* 长按已知网络 → 确认删除（框里再显示 SSID，所以标题只说"忘记网络"） */
+/* W_FORGET_TITLE    */ { "Forget network",                            "忘记网络" },
 };
 /* clang-format on */
 

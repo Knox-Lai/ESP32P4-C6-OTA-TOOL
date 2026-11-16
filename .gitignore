@@ -1,6 +1,15 @@
 # ---- 构建产物 ----
 build/
 
+# ---- IDF 组件管理器拉取的依赖（idf.py reconfigure 可重新下载，218 MB）----
+managed_components/
+dependencies.lock.bak
+
+# ---- 字体源文件（93 MB，Apple 版权，商用需授权）----
+# 字库产物 main/fonts/ui_font_zh_*.c 已入库，正常构建不需要这些 ttf。
+# 只有重跑 tools/fontgen/gen_fonts.py 才需要，请自行放回本地。
+design/PingFangSC-main/
+
 # ---- 日志 ----
 *.log
 

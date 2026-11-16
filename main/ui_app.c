@@ -44,6 +44,7 @@
 #include "i18n.h"
 #include "net_dhcps.h"
 #include "net_eth.h"
+#include "net_wifi.h"
 #include "ota_client.h"
 #include "ota_image.h"
 #include "ota_proto.h"
@@ -52,9 +53,9 @@
 static const char *TAG = "ui";
 
 /* 工具名/版本：桌面浮条和设置页关于都用这两个宏，改版本只改这里。
- * 名字本身是产品名不翻译；tagline 走 i18n。 */
-#define APP_NAME     "ESP32-P4 OTA Tool"
-#define APP_VERSION  "v0.9.0"
+ * 名字本身是产品名不翻译；tagline 走 i18n（内容是"以太网 + WiFi"两条通道）。 */
+#define APP_NAME     "Automatic Firmware Update Tool"
+#define APP_VERSION  "v1.0.0"
 
 /* ---------------- 配色（取自 iOS 系统色） ---------------- */
 /* 壁纸：淡蓝紫渐变（原版是 0x5B8DEF → 0x9B6FE0，偏浓；这里整体提亮降饱和，
@@ -84,6 +85,7 @@ typedef enum {
     APP_SETTINGS,
     APP_LANG,          /* 设置 → 语言（子页，不是桌面 App） */
     APP_BRIGHT,        /* 设置 → 亮度（子页，滑块） */
+    APP_WIFI,          /* 设置 → WiFi（子页，扫描 + 密码键盘） */
     APP_COUNT,
 } app_id_t;
 
@@ -96,46 +98,37 @@ static lv_obj_t *s_page[APP_COUNT];
 static app_id_t s_stack[NAV_MAX];
 static int      s_depth = 0;
 
-/* 顶部状态栏（全局，浮在所有页之上） */
-static lv_obj_t *s_sb      = NULL;
-static lv_obj_t *s_sb_dev  = NULL;
-static lv_obj_t *s_sb_fps  = NULL;
+/* 顶部状态栏（全局，浮在所有页之上）
+ *
+ * 现在只剩右侧两个网络接口图标（WiFi + 网线）。
+ * 左上角的设备数已去掉 —— 那个数字放在右上角太远、又只是"表里有几台"，
+ * 挪到桌面"设备"卡片里做成主信息更合适；右上角的帧率同理去掉，
+ * 它本来就是开发期看"到底是谁在乱重绘"的诊断量，不该占用户界面的位置。 */
+static lv_obj_t *s_sb = NULL;
 
-/* 状态栏缓存：只在文字/配色真的变了才写 label，避免 400 ms 无条件重绘 */
-static int  s_sb_last_dev  = -1;
-static bool s_sb_last_dark = false;
-
-/* ---- 帧率统计 ----
- * LVGL 只在有脏区时才走一遍 refr，所以 LV_EVENT_RENDER_READY 的触发次数
- * 就是"真实出帧数"，不是"屏幕刷了几次"。静态页面会稳定在 0，
- * 有动画/滚动才上去 —— 反过来说，纯静止时长期非 0 就说明有东西在乱重绘。
- * 不用 LV_USE_PERF_MONITOR：那个要在 lv_conf 里打开，还会往屏幕上盖一层
- * 半透明面板，正好和我们自己在画的状态栏打架。 */
-static volatile uint32_t s_fps_frames = 0;
-static uint32_t s_fps_last_cnt = 0;
-static int64_t  s_fps_last_us  = 0;
-static int      s_fps_shown    = -1;
-
-/* 桌面上那张"网络"卡里的 IP 是否已经写过（重建后需重置） */
+/* 桌面上那张"以太网"卡里的 IP 是否已经写过（重建后需重置） */
 static lv_obj_t *s_home_ip   = NULL;
 static lv_obj_t *s_home_link = NULL;
 static lv_obj_t *s_home_lease = NULL;
 static lv_obj_t *s_home_heap = NULL;
 
-/* 桌面右侧"系统状态"卡：CPU 折线 + 内存条 + TF 卡 */
-static lv_obj_t        *s_home_chart   = NULL;
-static lv_chart_series_t *s_home_cpu_ser = NULL;
-static lv_obj_t        *s_home_cpu_pct = NULL;
-static lv_obj_t        *s_home_mem_pct = NULL;
-static lv_obj_t        *s_home_mem_bar = NULL;
-static lv_obj_t        *s_home_tf      = NULL;
+/* 桌面右侧卡片：在线设备台数 + 内存条 + TF 卡
+ *
+ * 这里原来是 CPU 折线（60 点，每秒推一个点）。折线撤掉的原因有两个：
+ *   1) 每秒钟必然产生一次整块卡片的重绘，是"主页一直闪"的直接来源；
+ *   2) 对一个"刷固件"的工具来说，用户在主页想看的是"有几台设备能升"，
+ *      CPU 占用率属于开发期数据，要看可以进信息页（那里仍有百分比）。
+ */
+static lv_obj_t *s_home_online      = NULL;   /* 在线台数（大号数字） */
+static lv_obj_t *s_home_dev_off     = NULL;   /* 右上角"N 台离线"，0 台时隐藏 */
+static int       s_home_online_shown = -1;    /* 上次写入的在线台数 */
+static int       s_home_devoff_shown = -1;    /* 上次写入的离线台数 */
+static lv_obj_t *s_home_mem_pct = NULL;
+static lv_obj_t *s_home_mem_bar = NULL;
+static lv_obj_t *s_home_tf      = NULL;
 
-/* CPU 采样：每秒一个点，60 点 = 最近 1 分钟。
- * 环形缓冲留住历史 —— 重建界面（切语言）后折线不会从零开始。 */
-#define CPU_HIST      60
+/* CPU 采样：每秒一次，只为信息页那一行服务（页面不在时不写文字） */
 #define CPU_TASK_MAX  48            /* 任务数上限，uxTaskGetSystemState 的数组长度 */
-static uint8_t   s_cpu_hist[CPU_HIST];
-static uint32_t  s_cpu_hist_n = 0;  /* 累计采样次数，取模得到写入位置 */
 static int       s_cpu_pct    = -1; /* 最近一次算出的 CPU 占用率，-1 = 还没有 */
 static int64_t   s_cpu_next_us = 0; /* 下一次采样的时间戳 */
 
@@ -160,6 +153,7 @@ static lv_obj_t *s_dt_mac   = NULL;
 
 /* 升级页 */
 static int       s_upg_sel = -1;
+static lv_obj_t *s_upg_hdr   = NULL;   /* 左卡片标题 "SELECT DEVICE"，无设备时隐藏 */
 static lv_obj_t *s_upg_list  = NULL;
 static lv_obj_t *s_upg_arc   = NULL;
 static lv_obj_t *s_upg_pct   = NULL;
@@ -173,6 +167,7 @@ static bool      s_upg_have_sig = false;
 static lv_obj_t *s_in_ip, *s_in_mask, *s_in_gw, *s_in_link, *s_in_lease;
 static lv_obj_t *s_in_mem_pct, *s_in_mem_bar, *s_in_mem_sub, *s_in_psram;
 static lv_obj_t *s_in_flash, *s_in_min, *s_in_up, *s_in_dev, *s_in_ota;
+static lv_obj_t *s_in_cpu = NULL;   /* CPU 占用率（桌面折线撤掉后落在这一页） */
 
 /* ---- 背光亮度 ----
  * 0~100 (%)，写在 NVS（命名空间 "ui"，key "bright"，和语言同一个命名空间）。
@@ -187,6 +182,42 @@ static lv_obj_t *s_br_slider  = NULL;   /* 亮度子页的滑块（手势判命�
 static lv_obj_t *s_br_pct     = NULL;   /* 亮度子页的大号百分比 */
 static lv_obj_t *s_set_br_val = NULL;   /* 设置页"亮度"行右侧的数值 */
 
+/* ---- 设置 → WiFi ----
+ * 列表行只带索引，详情从这份快照里取：把 SSID 字符串挂在 user_data 上
+ * 会牵扯到何时 free（行被 lv_obj_clean 删掉时没有回调），索引最省事，
+ * 前提是快照和行永远同一次刷新生成 —— 所以两者都在 wifi_fill_list() 里一起动。 */
+static lv_obj_t *s_w_sw         = NULL;  /* 总开关 */
+/* 用户刚拨过开关的时刻（ms）。开关是异步生效的：拨到"开"之后要等一次性任务
+ * 跑完 net_wifi_set_enabled()，s_enabled 才真的变 true。这中间的几百毫秒里，
+ * 下面的"反向同步"会把开关又拨回去 —— 表现为"手指一松开关自己弹回原位"。
+ * 所以用户操作后 1.5 s 内不做反向同步。 */
+static int64_t   s_sw_touch_ms  = 0;
+static lv_obj_t *s_w_state      = NULL;  /* 状态行（已连接 SSID / IP / 信号） */
+static lv_obj_t *s_w_scan_lbl   = NULL;  /* "扫描"按钮上的字，扫描中改成"扫描中…" */
+static lv_obj_t *s_w_disc       = NULL;  /* "断开"按钮：已连/连接中/失败时显示 */
+static lv_obj_t *s_w_list       = NULL;  /* 网络列表容器 */
+static lv_obj_t *s_set_wifi_val = NULL;  /* 设置页"WiFi"行右侧的状态 */
+
+static net_wifi_ap_t s_w_aps[NET_WIFI_SCAN_MAX];
+static int       s_w_apn        = 0;
+static int       s_w_drawn_apn  = -1;    /* 列表是按多少条画的 */
+static int       s_w_drawn_st   = -1;    /* 画列表时的 WiFi 状态 */
+static bool      s_w_drawn_scan = false; /* 画列表时是否在扫描 */
+static int       s_w_drawn_sv   = -1;    /* 画列表时已知网络有几条 */
+
+/* 长按已知网络弹"忘记"框之后，松开时 LVGL 仍会给行发一次 CLICKED
+ * （长按不清 last_obj），那会顺手触发连接。这个标志把紧随其后的
+ * 那一次点击吞掉 —— 定义放在这里是因为 wifi_row_cb 比确认框先出现。 */
+static bool      s_row_long     = false;
+
+/* 密码浮层（模态：遮罩 + 卡片 + 软键盘），NULL = 没打开。
+ * 浮层挂在 lv_layer_top() 上，不是挂在页面上 —— 页面有入场动画、隐藏标志和
+ * 裁剪，浮层跟着页面走会出现"卡片在、键盘不在"这类 z 序问题。 */
+static lv_obj_t *s_pw_modal = NULL;
+static lv_obj_t *s_pw_ta    = NULL;
+static lv_obj_t *s_pw_kb    = NULL;
+static char      s_pw_ssid[NET_WIFI_SSID_MAX];
+
 /* ------------------------------------------------------------------
  * 刷新判重缓存。
  * 原来是 refresh_cb 里的函数内 static，切换语言重建界面后这些值还留着，
@@ -196,7 +227,7 @@ static lv_obj_t *s_set_br_val = NULL;   /* 设置页"亮度"行右侧的数值 *
 static int      s_heap_shown     = -1;          /* 桌面空闲内存（8 KB 死区） */
 static int      s_in_mem_shown   = -1;          /* 信息页内部 RAM 占用率 % */
 static int      s_flash_shown    = -1;          /* 信息页 Flash 容量（-1 未读，只读一次） */
-static int      s_home_cpu_shown = -1;          /* 桌面 CPU 百分比文字 */
+static int      s_in_cpu_shown   = -1;          /* 信息页 CPU 占用率 %（桌面折线撤掉后挪到这里） */
 static int      s_home_mem_shown = -1;          /* 桌面内存条百分比 */
 static int      s_tf_shown       = -2;          /* 桌面 TF 行：-2 未画，-1 无卡，1 有卡 */
 static int      s_arc_shown      = -1;          /* 升级页进度环 */
@@ -378,7 +409,114 @@ static void lan_icon_update(bool up, uint32_t fg)
     }
 }
 
-/* 状态栏：左边设备数，右边帧率 + 网线图标。
+/* 状态栏右上角的 WiFi 图标，排在网线图标左侧。
+ *
+ * 语义和网线图标完全一致（用户要"没连上就被划掉"，而不是整个消失）：
+ *   已连接（拿到 IP） → 按信号档位换字形，无斜杠；
+ *   关闭 / 未连 / 连接中 / 失败 / 硬件不可用 → 灰 wifi + 斜杠。
+ *
+ * 信号强度用**换字形**表达：1 档只有中心点，2 档点 + 一条弧，3 档两条，
+ * 4 档完整 wifi。字库里的 e6a1-e6a4 就是为此生成的。
+ *
+ * 走过的弯路记一下，别再回头：
+ *   ① 图标左侧加四段竖条 —— 用户否（"这样不好"）；
+ *   ② 用 lv_arc 自绘点 + 三条同心弧 —— 用户否（"太丑了"），自绘怎么调
+ *      参数都不如字形耐看；
+ *   ③ 只留原字形、靠颜色深浅 —— 一个 24 px 字形只有颜色一个维度，
+ *      四档灰在这块屏上分不出来；
+ *   ④ 用户下载了 signal-1..4（e646-e649）想直接用 —— 但 ttf 里这四个码位
+ *      被压成了同一个图形，直接用等于没分级。
+ *
+ * 于是现在这版：直接吃设计稿的 4 个 SVG（a-wifixinhaoqiangdu1..4.svg，
+ * 每个文件里"点亮"的部分是彩色 fill、未点亮的是 #DDDCDC），按 fill 过滤
+ * 就拿到 1/2/3/4 档各自的轮廓，生成 e6a1-e6a4 四个真字形（见
+ * tools/fontgen/gen_fonts.py 的 add_signal_glyphs）。换档时只改 label 的
+ * 文字。四档 advance 都是 1024、ink 水平居中、底边对齐，所以换字形时
+ * 图标不会横跳也不会上下蹦。 */
+
+static lv_obj_t *s_wifi       = NULL;
+static lv_obj_t *s_wifi_slash = NULL;
+static int       s_wifi_lvl   = -1;   /* 上次画的档位，0 = 未连接，-1 = 没画过 */
+
+/* 档位 → 字形。下标 0 对应 1 格，和 wifi_sig_level() 的返回值减一对应。 */
+static const char *const s_wifi_glyph[4] = { ICO_SIG1, ICO_SIG2, ICO_SIG3, ICO_SIG4 };
+
+/* 信号档位定义在 WiFi 列表那段（同一套阈值两处共用），
+ * 状态栏的档数必须和列表里的格数一致，否则同一个信号两块地方说不同的话。 */
+static int wifi_sig_level(int8_t rssi);
+
+static void wifi_icon_create(lv_obj_t *parent)
+{
+    /* 底色先按"未连接"画成"完整 wifi + 斜杠"：开机那几秒本来就没连上，
+     * 拿到 IP 之后再换成按档位的字形，中途不会闪出一个"已连接"的样子。
+     *
+     * 未连接也走 s_wifi_glyph[3] 而不是原来的 e7e0：两者 ink 尺寸不同
+     * （22.5×17.5 vs 21×15.5），连上/断开时图标会整体涨缩一圈。 */
+    s_wifi = icon_glyph(parent, s_wifi_glyph[3], C_SUB, &ui_icon_24);
+    lv_obj_align(s_wifi, LV_ALIGN_TOP_RIGHT, -46, 2);
+
+    s_wifi_slash = lan_slash(parent);
+    lv_obj_align_to(s_wifi_slash, s_wifi, LV_ALIGN_CENTER, 0, 0);
+    /* 3×24 + 0x6E6E73：
+     * 斜杠必须比底图（C_SUB 0x8E8E93）深一档才看得出来 —— 之前底图是
+     * LV_OPA_50 的浅灰，斜杠用 0x9A9AA0 就够了；底图改成实色之后
+     * 同样的斜杠几乎和笔画融在一起，"划掉"就没了。
+     * 3 px 宽仍是原来的细条，只是颜色回到中间调，不抢戏也不会消失。 */
+    lv_obj_set_size(s_wifi_slash, 3, 24);
+    lv_obj_set_style_radius(s_wifi_slash, 2, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_wifi_slash, lv_color_hex(0x6E6E73), LV_PART_MAIN);
+    /* lan_slash() 建出来默认是隐藏的（给网线用），这里一开始就要划掉 */
+    lv_obj_remove_flag(s_wifi_slash, LV_OBJ_FLAG_HIDDEN);
+
+    s_wifi_lvl = 0;
+}
+
+static void wifi_icon_update(void)
+{
+    if (s_wifi == NULL) {
+        return;
+    }
+
+    bool linked   = (net_wifi_state() == NET_WIFI_CONNECTED);
+    int8_t rssi   = net_wifi_rssi();
+    int lvl;
+
+    if (!linked) {
+        lvl = 0;
+    } else if (rssi > -120) {
+        lvl = wifi_sig_level(rssi);
+    } else {
+        /* 刚拿到 IP 的那几秒还没有 RSSI（5 s 才问一次）：保持上一次的档位，
+         * 一次都没取到就按满格 —— 已连接却只画一个点，看着像"信号为零"。 */
+        lvl = (s_wifi_lvl > 0) ? s_wifi_lvl : 4;
+    }
+
+    if (lvl == s_wifi_lvl) {
+        return;                     /* 档位没变就不碰对象，避免每 400 ms 触发重绘 */
+    }
+    s_wifi_lvl = lvl;
+
+    /* 换字形来表达强弱。四档 advance 相同、ink 水平居中、底边对齐，
+     * 所以 set_text 之后 label 宽度不变，右对齐位置不动。 */
+    if (lvl == 0) {
+        /* 未连接：完整 wifi + 斜杠，和已连接的档位字形同源，尺寸不跳 */
+        lv_label_set_text(s_wifi, s_wifi_glyph[3]);
+        lv_obj_set_style_text_color(s_wifi, lv_color_hex(C_SUB), LV_PART_MAIN);
+    } else {
+        lv_label_set_text(s_wifi, s_wifi_glyph[lvl - 1]);
+        /* 层数已经表达了强弱，颜色一律用正文色：再叠几档灰会让
+         * "一格"淡到像没连上。未连接才转灰，和断线网线同色。 */
+        lv_obj_set_style_text_color(s_wifi, lv_color_hex(C_TXT), LV_PART_MAIN);
+    }
+
+    if (linked) {
+        lv_obj_add_flag(s_wifi_slash, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(s_wifi_slash, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* 状态栏：左边设备数，右边帧率 + WiFi + 网线图标。
  * 它是屏幕直属子对象、最后创建，所以永远压在页面之上；
  * 透明且不可点，不会挡住下面的图标和列表。
  * 时间/日期先不做：本机没有 RTC 也没有 NTP，显示一个需要手动 time set
@@ -389,31 +527,11 @@ static void build_status_bar(lv_obj_t *scr)
     lv_obj_set_pos(s_sb, 0, 0);
     lv_obj_set_size(s_sb, BSP_LCD_H_RES, 30);
 
-    char cnt[32];
-    i18n_dev_count(cnt, sizeof(cnt), 0);
-    s_sb_dev = text(s_sb, cnt, UI_F_SMALL, C_TXT, 24, 6);
-
-    /* 帧率贴右侧，给 24 px 网线图标让出 24+18 的宽度。
-     * 宽度写死 72 px 并右对齐：读数从 "9 FPS" 变 "60 FPS" 时位数变化，
-     * 若让 label 自适应宽度，右边缘会跟着左右跳，看起来像图标在抖。 */
-    s_sb_fps = text(s_sb, "", UI_F_SMALL, C_TXT, 0, 6);
-    lv_obj_set_style_text_align(s_sb_fps, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
-    lv_obj_set_width(s_sb_fps, 72);
-    lv_obj_set_style_text_opa(s_sb_fps, LV_OPA_70, LV_PART_MAIN);  /* 弱于左侧设备数 */
-    lv_obj_align(s_sb_fps, LV_ALIGN_TOP_RIGHT, -52, 6);
-
+    /* 左右两侧都不放文字了：右边依次是 WiFi 和网线两个 24 px 图标
+     * （-18 网线、-46 WiFi，各占 24 px），左边空着。 */
     lan_icon_create(s_sb);
+    wifi_icon_create(s_sb);
     lv_obj_move_to_index(s_sb, -1);
-}
-
-/* display 每真正渲染完一帧发一次 RENDER_READY（core/lv_refr.c 末尾），
- * 拿它计数比用刷新定时器次数准：LVGL 没脏区时刷新定时器是 pause 状态，
- * 根本不会跑，所以静止页面这里就是 0。 */
-static void disp_frame_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) == LV_EVENT_RENDER_READY) {
-        s_fps_frames++;
-    }
 }
 
 /* ---- 刷新统计（诊断"到底是谁在闪"） ----
@@ -421,7 +539,10 @@ static void disp_frame_cb(lv_event_t *e)
  * 判据很直接：
  *   静止时一行应该是 "0 次"        → LVGL 没在画，闪就不是软件重绘引起的；
  *   静止时持续非 0，区域又是整屏   → 有对象在周期性 invalidate，看区域就能定位到是谁；
- *   区域只有一小块（状态栏那块）    → 只是数字更新，配合 VSYNC 对齐后不该看得见。 */
+ *   区域只有一小块（状态栏那块）    → 只是数字更新，配合 VSYNC 对齐后不该看得见。
+ *
+ * 这个统计仍然留着（只写串口、不上屏）：CPU 折线撤掉之后，静止的主页
+ * 刷新次数应该接近 0，一旦又开始周期性刷新，日志能第一时间指出来。 */
 static uint32_t s_flush_cnt = 0;
 static int32_t  s_flush_x1, s_flush_y1, s_flush_x2, s_flush_y2;
 
@@ -435,45 +556,6 @@ static void disp_flush_stat_cb(lv_event_t *e)
         s_flush_y1 = a->y1;
         s_flush_x2 = a->x2;
         s_flush_y2 = a->y2;
-    }
-}
-
-/* 1 秒窗口算一次帧率：窗口内渲染帧数 / 实际时长。
- * 用 esp_timer 而不是"400 ms × 次数"是因为定时器本身有抖动，
- * 用它算分母会让 55~60 之间来回跳。 */
-static void fps_tick(void)
-{
-    if (s_sb_fps == NULL) {
-        return;
-    }
-
-    int64_t  now = esp_timer_get_time();
-    uint32_t cnt = s_fps_frames;
-
-    if (s_fps_last_us == 0) {          /* 第一个窗口只取基准，不出数 */
-        s_fps_last_us  = now;
-        s_fps_last_cnt = cnt;
-        return;
-    }
-
-    int64_t dt_us = now - s_fps_last_us;
-    if (dt_us < 900000) {              /* 攒够约 1 s 再算，避免被 400 ms 节拍切碎 */
-        return;
-    }
-
-    uint32_t fps = (uint32_t)((uint64_t)(cnt - s_fps_last_cnt) * 1000000ull / (uint64_t)dt_us);
-
-    s_fps_last_us  = now;
-    s_fps_last_cnt = cnt;
-
-    /* 死区 2 帧：静止页面每秒唯一的一帧重绘，来源就是"上一拍写了 FPS 标签"本身。
-     * 写标签 → 渲染一帧 → 下一窗口算出 1 → 又写标签…… 永不收敛，
-     * 等于自己给自己制造周期重绘。差值 < 2 就不写，静止时稳定停在 0，
-     * 屏幕才真的完全静止（也能反过来证明没有别的东西在乱 invalidate）。 */
-    int diff = (int)fps - s_fps_shown;
-    if (s_fps_shown < 0 || diff >= 2 || diff <= -2) {
-        s_fps_shown = (int)fps;
-        set_txt_fmt(s_sb_fps, "%u FPS", (unsigned)fps);
     }
 }
 
@@ -505,14 +587,9 @@ static void sb_restyle(void)
         return;
     }
 
-    bool dark_ui = (s_cur == APP_HOME);
-    /* 壁纸改成淡色后，桌面和应用页都用深色字；dark_ui 只留作"配色变过"的判据 */
-    uint32_t fg = C_TXT;
-
-    lv_obj_set_style_text_color(s_sb_dev, lv_color_hex(fg), LV_PART_MAIN);
-
-    s_sb_last_dark = dark_ui;
-    lan_icon_update(net_eth_link_up(), fg);
+    /* 状态栏只剩两个图标：换页时按当前链路状态把网线图标重刷一次即可
+     * （WiFi 图标不走这里，它自己有状态判重）。 */
+    lan_icon_update(net_eth_link_up(), C_TXT);
 }
 
 static void page_show(app_id_t id, bool animate)
@@ -625,6 +702,11 @@ static bool point_on_bright_slider(lv_point_t p)
 
 /* 30 ms 轮询一次指针：LVGL 的手势事件默认没开（LV_USE_GESTURE_RECOGNITION=0），
  * 自己看按下起点的位移，判断是不是一次横滑，两个方向都支持。 */
+
+/* 密码浮层是否打开（实现在 WiFi 子页那一节）。打开时整页禁手势：
+ * 软键盘上换行/切符号很容易带上横向位移，那时返回上一层是最坏的结果。 */
+static bool wifi_modal_open(void);
+
 static void swipe_poll_cb(lv_timer_t *t)
 {
     (void)t;
@@ -652,6 +734,13 @@ static void swipe_poll_cb(lv_timer_t *t)
     /* 当前页不接受手势返回：本次按下直接作废（fired 置位，松手才复位）。
      * 亮度页不整页禁，只有起手点在滑块命中带里时才不算返回（见下）。 */
     if (s_cur == APP_HOME) {
+        s_sw_tracking = false;
+        s_sw_fired    = true;
+        return;
+    }
+
+    /* 密码浮层开着时一律不返回（键盘上的横滑太多了） */
+    if (wifi_modal_open()) {
         s_sw_tracking = false;
         s_sw_fired    = true;
         return;
@@ -785,24 +874,6 @@ static int cpu_load_calc(void)
     return load < 0 ? 0 : (load > 100 ? 100 : load);
 }
 
-/* 把环形缓冲里的历史灌回折线：不足 60 点的部分补 0，
- * 于是刚开机时折线从左边空白处慢慢长出来，而不是一上来就满屏。 */
-static void home_chart_seed(void)
-{
-    if (s_home_chart == NULL || s_home_cpu_ser == NULL) {
-        return;
-    }
-
-    const uint32_t cnt = s_cpu_hist_n < CPU_HIST ? s_cpu_hist_n : CPU_HIST;
-    for (uint32_t i = cnt; i < CPU_HIST; i++) {
-        lv_chart_set_next_value(s_home_chart, s_home_cpu_ser, 0);
-    }
-    for (uint32_t i = 0; i < cnt; i++) {
-        const uint32_t idx = (s_cpu_hist_n - cnt + i) % CPU_HIST;
-        lv_chart_set_next_value(s_home_chart, s_home_cpu_ser, s_cpu_hist[idx]);
-    }
-}
-
 /* 内部 RAM 占用率。口径与信息页一致：默认堆里并了 32 MB PSRAM，
  * 按默认堆算永远是两位数以下，看不出运行时压力。 */
 static int mem_used_pct(void)
@@ -831,20 +902,14 @@ static void fmt_cap(char *buf, size_t n, uint64_t used_kb, uint64_t total_kb)
 /* 每 400 ms 调一次的刷新；CPU 走 1 s 节拍，文字都带死区。 */
 static void home_stat_update(int64_t now_us)
 {
-    /* ---- CPU：1 s 一个采样点，和页面无关（离开桌面也保持历史连续） ---- */
+    /* ---- CPU：1 s 采样一次，只服务信息页那一行（折线已经撤掉了） ----
+     * 采样和页面无关：离开信息页也保持连续，回到页面时数字立刻是对的。 */
     if (now_us >= s_cpu_next_us) {
         s_cpu_next_us = now_us + 1000000;
 
         const int load = cpu_load_calc();
         if (load >= 0) {
             s_cpu_pct = load;
-            s_cpu_hist[s_cpu_hist_n % CPU_HIST] = (uint8_t)load;
-            s_cpu_hist_n++;
-
-            /* 页面不可见时 invalidate 会被 LVGL 直接丢掉，写它没有代价 */
-            if (s_home_chart != NULL && s_home_cpu_ser != NULL) {
-                lv_chart_set_next_value(s_home_chart, s_home_cpu_ser, load);
-            }
         }
     }
 
@@ -852,10 +917,24 @@ static void home_stat_update(int64_t now_us)
         return;                     /* 看不见就不写文字，省掉重排 */
     }
 
-    /* ---- CPU 百分比：整数变了才写 ---- */
-    if (s_cpu_pct >= 0 && s_cpu_pct != s_home_cpu_shown) {
-        s_home_cpu_shown = s_cpu_pct;
-        set_txt_fmt(s_home_cpu_pct, "CPU %d%%", s_cpu_pct);
+    /* ---- 设备台数：整数变了才写（稳态完全不重绘） ----
+     * 大字 = 已识别且在线的 OTA 设备；右上角只在真有设备掉线时才出现，
+     * 平时（离线 0 台）整条隐藏，避免又出现一个"看不懂的第二数字"。 */
+    const int online = dev_table_online_count();
+    if (online != s_home_online_shown) {
+        s_home_online_shown = online;
+        set_txt_fmt(s_home_online, "%d", online);
+    }
+
+    const int offl = dev_table_offline_count();
+    if (offl != s_home_devoff_shown) {
+        s_home_devoff_shown = offl;
+        if (offl <= 0) {
+            lv_obj_add_flag(s_home_dev_off, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            set_txt_fmt(s_home_dev_off, i18n_t(H_DEV_OFFLINE_FMT), (unsigned)offl);
+            lv_obj_remove_flag(s_home_dev_off, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     /* ---- 内存：2% 死区（内部 RAM 的 1% ≈ 4 KB，稳态下进度条不重绘） ---- */
@@ -908,59 +987,60 @@ static void build_home(lv_obj_t *page)
     s_home_heap = text(c1, "0 KB", UI_F_SMALL, C_TXT, 0, 172);
     lv_obj_align(s_home_heap, LV_ALIGN_TOP_RIGHT, -24, 172);
 
-    /* ---- 右：系统状态（CPU 折线 / 内存 / TF 卡） ----
-     * 这里原来显示"上次升级"的进度，但升级进度在升级页里更清楚，
-     * 桌面这块位置用来当运行状态看板更有用。
+    /* ---- 右：设备 / 运行状态（在线台数 + 内存 + TF 卡） ----
+     * 这里原来是 CPU 折线（60 点、每秒推一个点）。换成"在线设备台数"的理由：
+     * 主页是用户一进来就会看的位置，而"现在有几台设备能升、有几台掉线了"
+     * 才是这个工具的主信息；CPU 占用率属于开发期数据，信息页里仍有百分比。
+     * 顺带也去掉了每秒一次的整卡重绘（"主页一直闪"的老来源）。
      *
-     * 卡片用实底而不是像左边那样 80% 半透明：折线每秒都要重绘一次，
-     * 半透明意味着每次都要把下面的渐变壁纸重新合成一遍 —— 那正是
-     * "主页一直闪"的老原因。实底只填一层纯白，重绘代价低得多。 */
+     * 卡片仍然用实底而不是像左边那样 80% 半透明：半透明意味着每次重绘
+     * 都要把下面的渐变壁纸重新合成一遍。 */
     lv_obj_t *c2 = card(page, 526, 56, 466, 236, 24);
     lv_obj_set_style_border_width(c2, 0, LV_PART_MAIN);
 
-    text(c2, i18n_t(H_SYS_STATUS), UI_F_SMALL, C_SUB, 24, 16);
-    s_home_cpu_pct = text(c2, "--", UI_F_SMALL, C_BLUE, 0, 16);
-    lv_obj_align(s_home_cpu_pct, LV_ALIGN_TOP_RIGHT, -24, 16);
+    text(c2, i18n_t(H_DEVICES), UI_F_SMALL, C_SUB, 24, 16);
 
-    /* CPU 折线：60 点 = 最近 1 分钟，纵轴固定 0~100，只画线不画点 */
-    lv_obj_t *ch = lv_chart_create(c2);
-    lv_obj_remove_flag(ch, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_remove_flag(ch, LV_OBJ_FLAG_SCROLLABLE);   /* 折线不该跟着手指滚 */
-    lv_obj_set_pos(ch, 24, 44);
-    lv_obj_set_size(ch, 418, 92);
-    lv_obj_set_style_bg_opa(ch, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_width(ch, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(ch, 0, LV_PART_MAIN);
-    lv_obj_set_style_line_width(ch, 1, LV_PART_MAIN);        /* 横向分隔线 */
-    lv_obj_set_style_line_color(ch, lv_color_hex(0xEFEFF3), LV_PART_MAIN);
-    lv_obj_set_style_line_width(ch, 2, LV_PART_ITEMS);        /* 折线本身 */
-    lv_obj_set_style_width(ch, 0, LV_PART_INDICATOR);         /* 0 = 不画数据点 */
-    lv_obj_set_style_height(ch, 0, LV_PART_INDICATOR);
-    lv_chart_set_type(ch, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(ch, CPU_HIST);
-    lv_chart_set_axis_range(ch, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
-    lv_chart_set_div_line_count(ch, 2, 0);
-    s_home_cpu_ser = lv_chart_add_series(ch, lv_color_hex(C_BLUE), LV_CHART_AXIS_PRIMARY_Y);
-    lv_chart_set_all_values(ch, s_home_cpu_ser, 0);
-    s_home_chart = ch;
-    home_chart_seed();          /* 把环形缓冲里的历史灌回去 */
+    /* 大号数字 = 已识别且在线的 OTA 设备台数。
+     * 之前这里还有一个右上角"共 N 台"，取自设备表的 used 槽位数 ——
+     * 而表里凡是拿到 DHCP 租约的主机都会占一槽（PC、手机、打印机都算），
+     * 于是"共 5 台 / 在线 1 台"这种数字对用户毫无意义。
+     * 现在右上角只在真有已识别设备掉线时显示"N 台离线"，平时隐藏。 */
+    s_home_online = text(c2, "-", UI_F_LARGE, C_TXT, 24, 40);
+    text(c2, i18n_t(H_DEV_ONLINE), UI_F_SMALL, C_SUB, 24, 88);
 
-    /* 内存行：标签 + 细进度条 + 右侧百分比 */
-    text(c2, i18n_t(H_MEM), UI_F_SMALL, C_SUB, 24, 148);
+    s_home_dev_off = text(c2, "", UI_F_SMALL, C_SUB, 0, 56);
+    lv_obj_align(s_home_dev_off, LV_ALIGN_TOP_RIGHT, -24, 56);
+    lv_obj_add_flag(s_home_dev_off, LV_OBJ_FLAG_HIDDEN);   /* 0 台离线 → 不占位 */
+
+    /* 细分隔线：设备区 / 运行状态区各占一半，视觉上分得开 */
+    lv_obj_t *dsep = plain(c2);
+    lv_obj_set_pos(dsep, 24, 118);
+    lv_obj_set_size(dsep, 466 - 48, 1);
+    lv_obj_set_style_bg_color(dsep, lv_color_hex(C_LINE), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(dsep, LV_OPA_COVER, LV_PART_MAIN);
+
+    /* 内存行：标签 + 右侧百分比（同一行），进度条单独占下一行。
+     *
+     * 原来三者挤在一行：标签 x=24、进度条 x=78。中文"内存"只有 32 px 还看不出来，
+     * 英文 "MEMORY" 在 16 px 下约 66 px，直接压到进度条头上。
+     * 这一行的高度是随语言浮动的（"TF CARD" 也比 "TF 卡" 宽），
+     * 横向顺排就得先量文字宽度，量早了 coords 还没算出来；
+     * 改成上下两行最稳：进度条固定 x=24、占满卡片内宽，任何语言都不会撞。 */
+    text(c2, i18n_t(H_MEM), UI_F_SMALL, C_SUB, 24, 138);
+
+    s_home_mem_pct = text(c2, "--", UI_F_SMALL, C_TXT, 0, 138);
+    lv_obj_align(s_home_mem_pct, LV_ALIGN_TOP_RIGHT, -24, 138);
 
     s_home_mem_bar = lv_bar_create(c2);
     lv_obj_remove_flag(s_home_mem_bar, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_pos(s_home_mem_bar, 78, 154);
-    lv_obj_set_size(s_home_mem_bar, 300, 8);
+    lv_obj_set_pos(s_home_mem_bar, 24, 166);
+    lv_obj_set_size(s_home_mem_bar, 466 - 48, 8);   /* 卡片内宽，左右各留 24 px */
     lv_bar_set_range(s_home_mem_bar, 0, 100);
     lv_bar_set_value(s_home_mem_bar, 0, LV_ANIM_OFF);
     lv_obj_set_style_radius(s_home_mem_bar, 4, LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_home_mem_bar, lv_color_hex(0xE9E9EE), LV_PART_MAIN);
     lv_obj_set_style_radius(s_home_mem_bar, 4, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(s_home_mem_bar, lv_color_hex(C_BLUE), LV_PART_INDICATOR);
-
-    s_home_mem_pct = text(c2, "--", UI_F_SMALL, C_TXT, 0, 148);
-    lv_obj_align(s_home_mem_pct, LV_ALIGN_TOP_RIGHT, -24, 148);
 
     /* TF 卡行：只读缓存，不碰文件系统（f_getfree 要遍历 FAT，会卡 LVGL 任务） */
     text(c2, i18n_t(H_TF), UI_F_SMALL, C_SUB, 24, 190);
@@ -985,11 +1065,7 @@ static void build_home(lv_obj_t *page)
     lv_obj_set_style_text_color(dn, lv_color_hex(C_TXT), LV_PART_MAIN);
     lv_obj_align(dn, LV_ALIGN_LEFT_MID, 60, 0);
 
-    lv_obj_t *dtg = mk_label(dock);
-    lv_label_set_text(dtg, i18n_t(H_TAGLINE));
-    lv_obj_set_style_text_font(dtg, UI_F_SMALL, LV_PART_MAIN);
-    lv_obj_set_style_text_color(dtg, lv_color_hex(C_SUB), LV_PART_MAIN);
-    lv_obj_align(dtg, LV_ALIGN_LEFT_MID, 300, 0);
+    /* 原来的副标题 "Ethernet + Wi-Fi" 已按需求去掉，浮条只留工具名 + 版本 */
 
     lv_obj_t *dv = mk_label(dock);
     lv_label_set_text(dv, APP_VERSION);
@@ -1072,7 +1148,9 @@ static void build_dev_list(void)
         lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
 
         if (e->identified) {
-            text(r, e->id.model, UI_F_BASE, C_TXT, 48, 18);
+            /* 命中白名单显示规范名（"VENTRIX CPU"），否则原样显示设备自报的字符串 */
+            char mname[40];
+            text(r, dev_model_display(e->id.model, mname, sizeof(mname)), UI_F_BASE, C_TXT, 48, 18);
 
             char sub[64];
             snprintf(sub, sizeof(sub), "%d.%d.%d.%d    %s",
@@ -1176,7 +1254,8 @@ static void detail_fill(int idx)
     const dev_entry_t *e = &snap[idx];
 
     if (e->identified) {
-        set_txt(s_dt_model, e->id.model);
+        char mname[40];
+        set_txt(s_dt_model, dev_model_display(e->id.model, mname, sizeof(mname)));
         set_txt_fmt(s_dt_fw, "%u.%u.%u.%u",
                     e->id.fw_ver[0], e->id.fw_ver[1], e->id.fw_ver[2], e->id.fw_ver[3]);
         set_txt_fmt(s_dt_hw, "%u.%u", (unsigned)(e->id.hw_ver >> 8),
@@ -1303,11 +1382,22 @@ static void build_upg_list(void)
     lv_obj_clean(s_upg_list);
 
     if (n == 0) {
+        /* 一台设备都没有时，"SELECT DEVICE" 这个标题是空指的（下面没有可选的东西），
+         * 先把标题藏掉，只留居中的 "No device"，卡片里不出现两行自相矛盾的文案。 */
+        if (s_upg_hdr != NULL) {
+            lv_obj_add_flag(s_upg_hdr, LV_OBJ_FLAG_HIDDEN);
+        }
+
         lv_obj_t *l = mk_label(s_upg_list);
         lv_label_set_text(l, i18n_t(S_NO_DEVICE));
         lv_obj_set_style_text_font(l, UI_F_SMALL, LV_PART_MAIN);
         lv_obj_set_style_text_color(l, lv_color_hex(C_SUB), LV_PART_MAIN);
+        lv_obj_center(l);        /* 标题收起来后整块列表区是空的，居中比贴左上角好看 */
         return;
+    }
+
+    if (s_upg_hdr != NULL) {
+        lv_obj_remove_flag(s_upg_hdr, LV_OBJ_FLAG_HIDDEN);
     }
 
     if (s_upg_sel >= n) {
@@ -1342,7 +1432,7 @@ static void build_upgrade(lv_obj_t *page)
 {
     /* 左：设备选择 */
     lv_obj_t *left = card(page, 20, CONTENT_Y, 380, 492, 20);
-    text(left, i18n_t(U_SELECT_DEVICE), UI_F_SMALL, C_SUB, 20, 18);
+    s_upg_hdr = text(left, i18n_t(U_SELECT_DEVICE), UI_F_SMALL, C_SUB, 20, 18);
 
     s_upg_list = plain(left);
     lv_obj_set_pos(s_upg_list, 12, 50);
@@ -1458,6 +1548,7 @@ static void build_info(lv_obj_t *page)
     s_in_up    = info_row(b, i18n_t(I_UPTIME), 280);
     s_in_dev   = info_row(b, i18n_t(I_DEVICES), 320);
     s_in_ota   = info_row(b, i18n_t(I_OTA_STATE), 360);
+    s_in_cpu   = info_row(b, i18n_t(H_CPU), 400);   /* 桌面折线撤掉后，CPU 只在这里看 */
 }
 
 /* ---------------- 设置页 ---------------- */
@@ -1721,6 +1812,819 @@ static void build_bright(lv_obj_t *page)
     bright_apply(s_bright, false);      /* 把百分比文字补上（背光在进页面前已设过） */
 }
 
+/* ---------------- 设置 → WiFi ---------------- */
+
+#define WIFI_ROW_H     64
+#define WIFI_GROUP_H   34       /* 分组标题行（"已知网络" / "其他网络"） */
+#define WIFI_LIST_H    320      /* 5 行可见，再多靠滚动 */
+
+/* 给 swipe_poll_cb 用（它在文件前面，只能靠前向声明） */
+static bool wifi_modal_open(void)
+{
+    return s_pw_modal != NULL;
+}
+
+/* 失败原因的一句话文案。
+ *
+ * 归类在 net_wifi.c 里做（reason_kind()），这里只负责取字：
+ * 界面不该出现 "reason 15" 这种东西，也不该把 60 多个码位逐个翻译。
+ * OTHER 才退回通用"连接失败" —— 那种情况用户确实只能看串口日志。 */
+static const char *wifi_fail_text(void)
+{
+    switch (net_wifi_fail_reason()) {
+    case NET_WIFI_ERR_PASSWORD:  return i18n_t(W_ERR_PASSWORD);
+    case NET_WIFI_ERR_NO_AP:     return i18n_t(W_ERR_NO_AP);
+    case NET_WIFI_ERR_REJECTED:  return i18n_t(W_ERR_REJECTED);
+    case NET_WIFI_ERR_TIMEOUT:   return i18n_t(W_ERR_TIMEOUT);
+    case NET_WIFI_ERR_LINK_LOST: return i18n_t(W_ERR_LINK_LOST);
+    default:                     return i18n_t(W_FAILED);
+    }
+}
+
+/* 设置页那一行右侧的短状态 */
+static void wifi_short_state(char *buf, size_t n)
+{
+    switch (net_wifi_state()) {
+    case NET_WIFI_OFF:         snprintf(buf, n, "%s", i18n_t(W_OFF));         break;
+    case NET_WIFI_UNAVAILABLE: snprintf(buf, n, "%s", i18n_t(W_UNAVAILABLE)); break;
+    case NET_WIFI_CONNECTING:  snprintf(buf, n, "%s", i18n_t(W_CONNECTING));  break;
+    case NET_WIFI_CONNECTED:   snprintf(buf, n, "%s", net_wifi_ssid());       break;
+    case NET_WIFI_FAILED: {
+        /* 刚进 FAILED 的一秒内先按"连接中"显示：切网/重配可能只是过渡态，
+         * 钉上"连接失败"再跳回"已连接"很难看。根因在 net_wifi 的
+         * CONN_GRACE_MS 里已处理，这里是第二道保险（比如真失败时也不会
+         * 让四个字只闪一帧）。 */
+        int32_t age = net_wifi_fail_age_s();
+        if (age >= 0 && age < 1) {
+            snprintf(buf, n, "%s", i18n_t(W_CONNECTING));
+        } else if (!net_wifi_retry_pending()) {
+            /* 重连预算用尽：只留原因。这一行是设置页的窄行，加后缀会截断；
+             * 详细说明在 WiFi 子页（见 wifi_detail_state）。 */
+            snprintf(buf, n, "%s", wifi_fail_text());
+        } else if (age >= 5) {
+            /* 退避重连期间不能只剩一句"正在重试…"：那正是之前那版的问题
+             * —— 失败原因一闪而过，之后用户只看到一个永远转不完的状态。
+             * 原因留着，后面缀上"正在重试"，两件事一次说完。 */
+            snprintf(buf, n, i18n_t(W_RETRY_REASON_FMT), wifi_fail_text());
+        } else {
+            snprintf(buf, n, "%s", wifi_fail_text());
+        }
+        break;
+    }
+    default:                   snprintf(buf, n, "%s", i18n_t(W_NOT_CONNECTED)); break;
+    }
+}
+
+/* WiFi 子页状态行的长文本：连上时把 SSID / IP / 信号都摆出来，
+ * 这三样是现场排障最先要看的东西（能不能上网、信号够不够）。 */
+static void wifi_detail_state(char *buf, size_t n)
+{
+    net_wifi_state_t st = net_wifi_state();
+
+    switch (st) {
+    case NET_WIFI_OFF:
+        snprintf(buf, n, "%s", i18n_t(W_OFF));
+        break;
+    case NET_WIFI_UNAVAILABLE:
+        snprintf(buf, n, "%s", i18n_t(W_UNAVAILABLE));
+        break;
+    case NET_WIFI_CONNECTED: {
+        /* 分隔符必须按语言切：
+         *   中文走 ui_font_zh_16，字库里补了 U+00B7（见 gen_fonts.py 的
+         *   EXTRA_SYMBOLS），中点正常；
+         *   英文走 lv_font_montserrat_14，那套只有 ASCII，U+00B7 会被渲染成
+         *   方块（用户反馈"英文界面下那个也是方块"）。
+         * 不去给 montserrat 加 fallback：两套字库行高与字宽不同，
+         * 混排会让整行基线抖动，代价远大于换个分隔符。 */
+        const char *sep = (i18n_lang() == LANG_ZH) ? " · " : "  |  ";
+
+        /* RSSI 是连上之后每 5 s 才刷一次的（RPC 不便宜），
+         * 刚拿到 IP 的那几秒还是无效值 -127；这时候别把 -127 dBm 甩给用户，
+         * 只显示 SSID + IP。 */
+        int8_t r = net_wifi_rssi();
+        if (r <= -127) {
+            snprintf(buf, n, "%s%s%s", net_wifi_ssid(), sep, net_wifi_ip());
+        } else {
+            snprintf(buf, n, "%s%s%s%s%d dBm",
+                     net_wifi_ssid(), sep, net_wifi_ip(), sep, (int)r);
+        }
+        break;
+    }
+    case NET_WIFI_CONNECTING:
+        snprintf(buf, n, "%s %s", i18n_t(W_CONNECTING), net_wifi_ssid());
+        break;
+    case NET_WIFI_FAILED: {
+        /* 同 wifi_short_state：第一秒按"连接中"显示，别闪失败。
+         * 之后 1~5 s 显示"原因: SSID"（还能看出在连谁）；
+         * 退避重连阶段只留原因 + 正在重试，行宽才够，也不会把
+         * SSID 顶到屏幕外。 */
+        int32_t age = net_wifi_fail_age_s();
+        if (age >= 0 && age < 1) {
+            snprintf(buf, n, "%s %s", i18n_t(W_CONNECTING), net_wifi_ssid());
+        } else if (!net_wifi_retry_pending()) {
+            /* 重连用完了：把"停了"说出来，否则用户会一直等它自己好。
+             * 行的宽度够（712 px），"原因 + 已停止重试"一行放得下。 */
+            snprintf(buf, n, i18n_t(W_ERR_STOPPED_FMT), wifi_fail_text());
+        } else if (age >= 5) {
+            snprintf(buf, n, i18n_t(W_RETRY_REASON_FMT), wifi_fail_text());
+        } else {
+            snprintf(buf, n, "%s: %s", wifi_fail_text(), net_wifi_ssid());
+        }
+        break;
+    }
+    default:
+        snprintf(buf, n, "%s", i18n_t(W_NOT_CONNECTED));
+        break;
+    }
+}
+
+/* 信号强度分 4 档。原来只用图标颜色深浅区分（深灰 / 中灰 / 浅灰），
+ * 实测这块屏上三种灰几乎分不出来，"信号好不好"完全看不出 —— 改成
+ * "信号格 + dBm 数字"：格数给一眼的强弱，数字给现场排障要的具体值。 */
+static int wifi_sig_level(int8_t rssi)
+{
+    if (rssi >= -55) {
+        return 4;                   /* 满格：贴着路由 */
+    }
+    if (rssi >= -67) {
+        return 3;
+    }
+    if (rssi >= -78) {
+        return 2;
+    }
+    return 1;                       /* 一格：勉强能扫到 */
+}
+
+static uint32_t wifi_sig_color(int8_t rssi)
+{
+    switch (wifi_sig_level(rssi)) {
+    case 4:  return C_TXT;
+    case 3:  return 0x5A5A66;
+    case 2:  return C_SUB;
+    default: return 0xA8A8B2;
+    }
+}
+
+/* 四段竖条，底边对齐：亮起的格数 = 档位；没亮的那几格用浅灰画出来
+ * （不画的话"1 格"和"根本没画图标"分不清）。 */
+static void wifi_sig_bars(lv_obj_t *row, int8_t rssi)
+{
+    static const int8_t hgt[4] = { 8, 12, 16, 20 };
+    const int lvl  = wifi_sig_level(rssi);
+    const uint32_t on = wifi_sig_color(rssi);
+    const int base = (WIFI_ROW_H - 22) / 2;      /* 22 = 最高那格，整体垂直居中 */
+
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *b = plain(row);
+        lv_obj_set_size(b, 5, hgt[i]);
+        lv_obj_set_pos(b, 2 + i * 8, base + (22 - hgt[i]));
+        lv_obj_set_style_radius(b, 2, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(b, lv_color_hex(i < lvl ? on : 0xE2E2E8), LV_PART_MAIN);
+    }
+}
+
+/* 点击某一行的动作分三种：已连接 → 忽略；存过密码 → 直接连；
+ * 其余加密网络 → 弹密码框。开放网络直接连。 */
+
+/* 连接一定要走独立任务：net_wifi_connect() 写 NVS（nvs_commit 要几百字节栈），
+ * 在 LVGL 任务里直接做有溢栈风险 —— 亮度和语言当初就是因为这个改成异步的。 */
+typedef struct {
+    char ssid[NET_WIFI_SSID_MAX];
+    char pass[NET_WIFI_PASS_MAX];
+    bool use_saved;             /* true = 用已存密码（pass 忽略） */
+} wifi_cred_t;
+
+static void open_password(const char *ssid);
+
+static void wifi_connect_task(void *arg)
+{
+    wifi_cred_t *c = (wifi_cred_t *)arg;
+
+    if (c->use_saved) {
+        net_wifi_connect_saved(c->ssid);
+    } else {
+        net_wifi_connect(c->ssid, c->pass, true);
+    }
+
+    free(c);
+    vTaskDelete(NULL);
+}
+
+static bool wifi_connect_async(const char *ssid, const char *pass, bool use_saved)
+{
+    wifi_cred_t *c = calloc(1, sizeof(*c));
+    if (c == NULL) {
+        return false;
+    }
+
+    strncpy(c->ssid, ssid, NET_WIFI_SSID_MAX - 1);
+    if (pass != NULL) {
+        strncpy(c->pass, pass, NET_WIFI_PASS_MAX - 1);
+    }
+    c->use_saved = use_saved;
+
+    if (xTaskCreate(wifi_connect_task, "wifi_conn", 4096, c, 4, NULL) != pdPASS) {
+        free(c);
+        return false;
+    }
+    return true;
+}
+
+static void wifi_row_cb(lv_event_t *e)
+{
+    if (s_row_long) {
+        s_row_long = false;         /* 长按弹框后松开的那次 CLICKED，吞掉 */
+        return;
+    }
+
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_w_apn) {
+        return;
+    }
+
+    const net_wifi_ap_t *a = &s_w_aps[idx];
+    ESP_LOGI(TAG, "选中网络 \"%s\"（rssi=%d auth=%u saved=%d）",
+             a->ssid, (int)a->rssi, (unsigned)a->authmode, (int)a->saved);
+
+    if (net_wifi_state() == NET_WIFI_CONNECTED &&
+        strncmp(a->ssid, net_wifi_ssid(), NET_WIFI_SSID_MAX - 1) == 0) {
+        return;                     /* 已经连着它了 */
+    }
+
+    if (a->saved) {
+        /* 上一次就是拿这个网络的"已存密码"连失败 → 存的那份很可能不对
+         * （密码改过、或者是从旧固件带进来的脏数据）。此时再走
+         * connect_saved 只会用同一份错密码白试一轮，用户会觉得
+         * "我密码明明是对的、怎么点都失败"。
+         * 改成弹密码框：密文已预填（见 open_password），
+         * 想直接重试就按"连接"，想改密码就改——两条路都留着。 */
+        if (net_wifi_state() == NET_WIFI_FAILED &&
+            strncmp(a->ssid, net_wifi_ssid(), NET_WIFI_SSID_MAX - 1) == 0) {
+            ESP_LOGI(TAG, "已存密码连接失败，改为重新输入：\"%s\"", a->ssid);
+            open_password(a->ssid);
+            return;
+        }
+        wifi_connect_async(a->ssid, NULL, true);   /* 走已存密码 */
+        return;
+    }
+    if (a->authmode == 0) {                        /* WIFI_AUTH_OPEN */
+        wifi_connect_async(a->ssid, "", false);
+        return;
+    }
+    open_password(a->ssid);
+}
+
+static void wifi_scan_cb(lv_event_t *e)
+{
+    (void)e;
+    net_wifi_scan_start();
+}
+
+/* "断开"：不只是断当前连接，同时清掉 s_want，让重连退避停下来。
+ * 用户连错网络、或者不想让它开机自动连回去时，这是唯一的出口。
+ * 仍走一次性任务：esp_wifi_disconnect() 是 RPC，别在 LVGL 任务里同步等。 */
+static void wifi_disconnect_task(void *arg)
+{
+    (void)arg;
+    net_wifi_disconnect();
+    vTaskDelete(NULL);
+}
+
+static void wifi_disconnect_cb(lv_event_t *e)
+{
+    (void)e;
+    if (xTaskCreate(wifi_disconnect_task, "wifi_dis", 3072, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "断开任务创建失败");
+    }
+}
+
+/* 开关回调：net_wifi_set_enabled() 会写 NVS（nvs_commit 要几百字节栈），
+ * 不能直接在 LVGL 任务里做，扔给一次性任务。 */
+static void wifi_enable_task(void *arg)
+{
+    net_wifi_set_enabled((bool)(intptr_t)arg);
+    vTaskDelete(NULL);
+}
+
+static void wifi_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    s_sw_touch_ms = esp_timer_get_time() / 1000;
+
+    if (xTaskCreate(wifi_enable_task, "wifi_en", 3072, (void *)(intptr_t)on, 5, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "开关任务创建失败");
+        return;
+    }
+    if (on) {
+        /* 开关一打开就搜一次。此刻驱动大概率还没起来（C6 走一遍 SDIO 握手要几秒），
+         * net_wifi_scan_start() 会把这个请求挂起，等 STA_START 之后由 wifi 任务
+         * 自动补扫 —— 见 net_wifi.c 的 s_scan_wanted。 */
+        net_wifi_scan_start();
+    }
+}
+
+/* 点"WiFi"进子页 */
+static void wifi_fill_list(void);
+
+static void wifi_open_cb(lv_event_t *e)
+{
+    (void)e;
+    page_show(APP_WIFI, true);
+    wifi_fill_list();               /* 先把旧结果摆上，别让列表空 400 ms */
+    if (net_wifi_enabled()) {
+        net_wifi_scan_start();      /* 进页面就刷一次，别让用户先按"扫描" */
+    }
+}
+
+/* ---- 密码浮层 ---- */
+
+static void close_password(void)
+{
+    if (s_pw_modal != NULL) {
+        lv_obj_delete(s_pw_modal);      /* 子对象（键盘、文本框）一起删 */
+        s_pw_modal = NULL;
+        s_pw_ta    = NULL;
+        s_pw_kb    = NULL;
+    }
+}
+
+static void pw_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    close_password();
+}
+
+static void pw_connect_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_pw_ta == NULL) {
+        return;
+    }
+    const char *pass = lv_textarea_get_text(s_pw_ta);
+    /* 空密码也放行：有的是"开放但广播了加密类型"的怪 AP，
+     * 真连不上会走失败重试，用户能看到结果 */
+    wifi_connect_async(s_pw_ssid, pass, false);
+    close_password();
+}
+
+static void pw_kb_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+
+    if (code == LV_EVENT_READY) {           /* 键盘右下角的勾 */
+        pw_connect_cb(e);
+    } else if (code == LV_EVENT_CANCEL) {   /* 键盘左上角的收起 */
+        close_password();
+    }
+}
+
+/* 点一下输入框 → 保证键盘可见并重新绑定。
+ * LVGL 的键盘不会"跟着输入框自动出现"（只有按下特定键时才发 READY/CANCEL，
+ * 而且默认示例是自己在获得焦点时 remove_flag(HIDDEN)）。这里显式兜底，
+ * 免得出现"输入框有焦点、键盘不见了"的死局。 */
+static void pw_ta_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_pw_kb == NULL || s_pw_ta == NULL) {
+        return;
+    }
+    lv_keyboard_set_textarea(s_pw_kb, s_pw_ta);
+    lv_obj_remove_flag(s_pw_kb, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* 造一个文字按钮（浮层用，尺寸和设置页的行不是一套） */
+static lv_obj_t *pw_button(lv_obj_t *parent, int x, int y, int w, int h,
+                           const char *label, uint32_t bg, uint32_t fg,
+                           lv_event_cb_t cb)
+{
+    lv_obj_t *b = pill(parent, x, y, w, h, bg, LV_OPA_COVER);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_set_style_border_width(b, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(b, lv_color_hex(C_LINE), LV_PART_MAIN);
+
+    lv_obj_t *t = mk_label(b);
+    lv_label_set_text(t, label);
+    lv_obj_set_style_text_font(t, UI_F_SMALL, LV_PART_MAIN);
+    lv_obj_set_style_text_color(t, lv_color_hex(fg), LV_PART_MAIN);
+    lv_obj_center(t);
+    return b;
+}
+
+static void open_password(const char *ssid)
+{
+    if (s_pw_modal != NULL) {
+        close_password();
+    }
+    strncpy(s_pw_ssid, ssid, NET_WIFI_SSID_MAX - 1);
+    s_pw_ssid[NET_WIFI_SSID_MAX - 1] = '\0';
+
+    /* 遮罩挂在 lv_layer_top() 上：这一层永远压在所有页面之上，不受页面的
+     * 入场动画 / 隐藏标志 / 裁剪影响。设成可点是为了把点击吃掉，别透到下面。 */
+    lv_obj_t *modal = plain(lv_layer_top());
+    lv_obj_set_pos(modal, 0, 0);
+    lv_obj_set_size(modal, BSP_LCD_H_RES, BSP_LCD_V_RES);
+    lv_obj_set_style_bg_color(modal, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(modal, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_add_flag(modal, LV_OBJ_FLAG_CLICKABLE);
+    s_pw_modal = modal;
+
+    /* 卡片 210 高 + 键盘 300 高，加起来 40 + 210 + 12 + 300 = 562，
+     * 留在 600 的屏里还有 38 px 余量，不会压到屏幕边缘。 */
+    lv_obj_t *c = card(modal, 32, 40, 960, 210, 24);
+
+    lv_obj_t *t = text(c, s_pw_ssid, UI_F_BASE, C_TXT, 28, 14);
+    lv_obj_set_width(t, 900);
+    lv_label_set_long_mode(t, LV_LABEL_LONG_MODE_DOTS);
+
+    text(c, i18n_t(W_PASSWORD), UI_F_SMALL, C_SUB, 28, 48);
+
+    s_pw_ta = lv_textarea_create(c);
+    lv_obj_set_pos(s_pw_ta, 28, 74);
+    lv_obj_set_size(s_pw_ta, 620, 64);
+    lv_textarea_set_one_line(s_pw_ta, true);
+    lv_textarea_set_password_mode(s_pw_ta, true);
+    lv_textarea_set_max_length(s_pw_ta, NET_WIFI_PASS_MAX - 1);
+    lv_textarea_set_placeholder_text(s_pw_ta, "********");
+    /* 已存的密码预填进去（掩码显示，屏上看不见明文）：
+     * 这个框只在两种情况下弹 —— 第一次给新网络输密码（预填为空串，无影响），
+     * 或者已存密码连失败（预填的就是失败的那份）。后者让用户能
+     * "直接按连接重试"或"改掉错的那几位"，不必把整串重新敲一遍。 */
+    if (net_wifi_state() == NET_WIFI_FAILED &&
+        strncmp(ssid, net_wifi_ssid(), NET_WIFI_SSID_MAX - 1) == 0) {
+        lv_textarea_set_text(s_pw_ta, net_wifi_pass());
+    }
+    lv_obj_set_style_text_font(s_pw_ta, UI_F_BASE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_pw_ta, lv_color_hex(0xF4F4F8), LV_PART_MAIN);
+    lv_obj_set_style_border_color(s_pw_ta, lv_color_hex(C_BLUE), LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_pw_ta, 2, LV_STATE_FOCUSED);
+    lv_obj_set_style_radius(s_pw_ta, 12, LV_PART_MAIN);
+
+    pw_button(c, 688, 74, 108, 64, i18n_t(W_CANCEL), C_CARD, C_BLUE, pw_cancel_cb);
+    pw_button(c, 808, 74, 124, 64, i18n_t(W_CONNECT), C_BLUE, 0xFFFFFF, pw_connect_cb);
+
+    /* 软键盘：和卡片同宽，贴在卡片下方。300 px / 4 行 = 每行 75 px，
+     * 手指按得准；之前 210 px 时每行只有 52 px，本来就偏小。
+     *
+     * 注意用 lv_obj_align(..., LV_ALIGN_DEFAULT, x, y) 而不是 lv_obj_set_pos：
+     * lv_keyboard 的构造函数里有 lv_obj_align(obj, LV_ALIGN_BOTTOM_MID, 0, 0)，
+     * 会把对齐方式存成样式；只要 align 不是 DEFAULT，lv_obj_refr_pos() 就按
+     * 对齐算坐标、完全忽略 set_pos 写进去的 x/y —— 位置会被"底部居中"吃掉。 */
+    lv_obj_t *kb = lv_keyboard_create(modal);
+    lv_obj_set_size(kb, 960, 300);
+    lv_obj_align(kb, LV_ALIGN_DEFAULT, 32, 262);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_keyboard_set_textarea(kb, s_pw_ta);
+
+    /* 这三句是"点了输入框没键盘"的直接对症处理：
+     *   remove_flag(HIDDEN) —— 键盘控件默认可能带隐藏标志（LVGL 文档的例子
+     *                          里就是自己 add_flag(HIDDEN) 再在获得焦点时放开），
+     *                          我们不玩"按需弹出"，建出来就必须是可见的；
+     *   move_to_index(-1)   —— 保证键盘压在卡片之后的 top 位置，不被任何
+     *                          后建的子对象盖住；
+     *   remove_flag(IGNORE_LAYOUT) 不需要，位置是显式 set_pos 算好的。 */
+    lv_obj_remove_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_to_index(kb, -1);
+    s_pw_kb = kb;
+
+    lv_obj_add_event_cb(kb, pw_kb_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(kb, pw_kb_cb, LV_EVENT_CANCEL, NULL);
+
+    /* 键盘样式跟着白色卡片走，默认主题偏灰，放在浅色页面上像挖了个洞 */
+    lv_obj_set_style_bg_color(kb, lv_color_hex(C_CARD), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(kb, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(kb, lv_color_hex(C_LINE), LV_PART_MAIN);
+    lv_obj_set_style_radius(kb, 18, LV_PART_MAIN);
+
+    /* 输入框一被点就把键盘放出来（有些情况下键盘会自己消失，
+     * 比如按过键、或别处改过标志），这里兜一道底。 */
+    lv_obj_add_event_cb(s_pw_ta, pw_ta_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_pw_ta, pw_ta_cb, LV_EVENT_FOCUSED, NULL);
+
+    ESP_LOGI(TAG, "密码浮层：ssid=\"%s\" ta=%p kb=%p", s_pw_ssid,
+             (void *)s_pw_ta, (void *)s_pw_kb);
+}
+
+/* ---- 忘记某个已知网络（长按列表行） ----
+ *
+ * 为什么要有这个入口：以前只有串口 `wifi forget` 能清，而且一次清整表。
+ * 一条脏记录（比如旧固件在"下发配置就落表"时代写进去的错密码网络）
+ * 会一直卡在 Known networks 里，用户既删不掉、点它又只会用错密码白试。
+ *
+ * 交互：长按已知网络行 → 确认框 → 忘了这一条（连同密码）。 */
+static lv_obj_t *s_fg_modal = NULL;
+static char      s_fg_ssid[NET_WIFI_SSID_MAX];
+static volatile bool s_fg_busy = false;   /* 后台任务正在删，连点只算一次 */
+
+static void close_forget(void)
+{
+    if (s_fg_modal != NULL) {
+        lv_obj_delete(s_fg_modal);
+        s_fg_modal = NULL;
+    }
+}
+
+static void forget_task(void *arg)
+{
+    char *ssid = (char *)arg;
+    net_wifi_forget_one(ssid);
+    free(ssid);
+    s_fg_busy = false;
+    vTaskDelete(NULL);
+}
+
+static void fg_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    close_forget();
+}
+
+static void fg_ok_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_fg_busy) {
+        return;
+    }
+    s_fg_busy = true;
+
+    /* 先关框再干活：删除要断开连接 + 写 NVS，都是慢操作，
+     * 不能卡在 LVGL 任务里 */
+    char *ssid = strdup(s_fg_ssid);
+    close_forget();
+    if (ssid == NULL || xTaskCreate(forget_task, "wifi_fg", 5120, ssid, 4, NULL) != pdPASS) {
+        free(ssid);
+        s_fg_busy = false;
+        ESP_LOGW(TAG, "忘记网络任务创建失败");
+    }
+}
+
+static void open_forget_confirm(const char *ssid)
+{
+    if (s_fg_modal != NULL) {
+        close_forget();
+    }
+    strncpy(s_fg_ssid, ssid, NET_WIFI_SSID_MAX - 1);
+    s_fg_ssid[NET_WIFI_SSID_MAX - 1] = '\0';
+
+    lv_obj_t *modal = plain(lv_layer_top());
+    lv_obj_set_pos(modal, 0, 0);
+    lv_obj_set_size(modal, BSP_LCD_H_RES, BSP_LCD_V_RES);
+    lv_obj_set_style_bg_color(modal, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(modal, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_add_flag(modal, LV_OBJ_FLAG_CLICKABLE);
+    s_fg_modal = modal;
+
+    /* 520×180 居中：比密码框窄，因为它只有一句话和两个按钮 */
+    lv_obj_t *c = card(modal, 252, 210, 520, 180, 24);
+
+    text(c, i18n_t(W_FORGET_TITLE), UI_F_BASE, C_TXT, 28, 24);
+
+    /* SSID 单独一行：确认框里必须能看清"到底要删哪个" */
+    lv_obj_t *nm = text(c, s_fg_ssid, UI_F_SMALL, C_SUB, 28, 62);
+    lv_obj_set_width(nm, 464);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_MODE_DOTS);
+
+    pw_button(c, 248, 108, 116, 48, i18n_t(W_CANCEL), C_CARD, C_BLUE, fg_cancel_cb);
+    /* 危险操作用红字白底，和"取消"区分开 */
+    pw_button(c, 372, 108, 116, 48, i18n_t(W_FORGET), C_CARD, 0xD93025, fg_ok_cb);
+}
+
+static void wifi_row_long_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_w_apn) {
+        return;
+    }
+
+    const net_wifi_ap_t *a = &s_w_aps[idx];
+    if (!a->saved) {
+        return;                 /* 没存过密码的网络没什么可忘记的 */
+    }
+
+    ESP_LOGI(TAG, "长按已知网络 \"%s\"，弹忘记确认", a->ssid);
+    s_row_long = true;
+    open_forget_confirm(a->ssid);
+}
+
+/* ---- 列表 ---- */
+
+/* 分组标题：全大写小字 + 灰色，尺寸对齐 iOS 的"Known Networks"那种分隔条。
+ * 高度由调用方按 WIFI_GROUP_H 记账。 */
+static void wifi_group_title(lv_obj_t *parent, int y, i18n_str_t s)
+{
+    lv_obj_t *t = text(parent, i18n_t(s), UI_F_SMALL, C_SUB, 4, y + 10);
+    lv_obj_set_width(t, 900);
+}
+
+/* 画一行网络。y 是列表内的绝对位置 —— 分组标题占掉一段之后，
+ * 行号乘行高就不对了，所以位置必须由调用方累加着传进来。
+ * idx 是 s_w_aps 的下标，点击回调直接用它取数据。 */
+static void wifi_list_row(lv_obj_t *parent, int y, int idx, bool connected)
+{
+    const net_wifi_ap_t *a = &s_w_aps[idx];
+
+    lv_obj_t *r = plain(parent);
+    lv_obj_set_pos(r, 0, y);
+    lv_obj_set_size(r, 936, WIFI_ROW_H);
+    lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(r, wifi_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+    /* 长按已知网络 = 忘记它（见 open_forget_confirm）。
+     * 未保存的行在回调里自己 return，不额外判断。 */
+    lv_obj_add_event_cb(r, wifi_row_long_cb, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)idx);
+    lv_obj_set_style_radius(r, 12, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(r, lv_color_hex(0xE9E9EE), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(r, LV_OPA_COVER, LV_STATE_PRESSED);
+
+    wifi_sig_bars(r, a->rssi);                     /* 左侧四段信号格 */
+
+    lv_obj_t *nm = text(r, a->ssid, UI_F_BASE, C_TXT, 0, 0);
+    lv_obj_set_width(nm, 520);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_align(nm, LV_ALIGN_LEFT_MID, 42, 0);   /* 定宽之后再对齐，否则按文本宽度算 */
+
+    /* 右侧先摆 dBm 数字（固定贴最右，宽度随机变化），
+     * 后面的"已连接 / 已保存 / 开放"标记再从它左边往外排 —— 这样
+     * SSID 长短、标记有无都不会让 dBm 的位置左右跳。 */
+    char dbm[16];
+    snprintf(dbm, sizeof(dbm), "%d dBm", (int)a->rssi);
+    lv_obj_t *dv = text(r, dbm, UI_F_SMALL, wifi_sig_color(a->rssi), 0, 0);
+    lv_obj_align(dv, LV_ALIGN_RIGHT_MID, -8, 0);
+
+    /* 右侧标记，优先级：已连接 > 已保存 > 开放网络 > （加密，不标） */
+    const char *tag = NULL;
+    uint32_t    tag_c = C_SUB;
+    if (connected && strncmp(a->ssid, net_wifi_ssid(), NET_WIFI_SSID_MAX - 1) == 0) {
+        tag   = i18n_t(W_CONNECTED);
+        tag_c = C_BLUE;
+    } else if (a->saved) {
+        tag = i18n_t(W_SAVED);
+    } else if (a->authmode == 0) {
+        tag = i18n_t(W_OPEN);
+    }
+
+    if (tag != NULL) {
+        lv_obj_t *tv = text(r, tag, UI_F_SMALL, tag_c, 0, 0);
+        lv_obj_align_to(tv, dv, LV_ALIGN_OUT_LEFT_MID, -14, 0);
+    }
+}
+
+/* 重建列表：只在"条数 / 连接状态 / 是否在扫描"变了时才做
+ * （每 400 ms 重建一次列表会让整页持续重绘，就是之前主页闪的老毛病）。 */
+static void wifi_fill_list(void)
+{
+    if (s_w_list == NULL) {
+        return;
+    }
+
+    lv_obj_clean(s_w_list);
+
+    s_w_apn = net_wifi_scan_get(s_w_aps, NET_WIFI_SCAN_MAX);
+
+    if (s_w_apn <= 0) {
+        lv_obj_t *empty = mk_label(s_w_list);
+        lv_label_set_text(empty, i18n_t(net_wifi_scanning() ? W_SCANNING : W_NO_AP));
+        lv_obj_set_style_text_font(empty, UI_F_SMALL, LV_PART_MAIN);
+        lv_obj_set_style_text_color(empty, lv_color_hex(C_SUB), LV_PART_MAIN);
+        lv_obj_set_width(empty, 936);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_pos(empty, 0, 120);
+
+        /* 空列表也要更新这三个值：否则 refresh_cb 每次都认为"还没画过"，
+         * 每 400 ms 重建一次空标签 —— 屏幕上就是一行字不停闪。 */
+        s_w_drawn_apn  = s_w_apn;
+        s_w_drawn_st   = (int)net_wifi_state();
+        s_w_drawn_scan = net_wifi_scanning();
+        s_w_drawn_sv   = net_wifi_saved_count();
+        return;
+    }
+
+    bool connected = (net_wifi_state() == NET_WIFI_CONNECTED);
+
+    /* 就地刷新 saved 标记：刚连上的那一刻凭据才进表，而 s_aps 里的标记
+     * 还是上次扫描时算的。不刷新的话要等下一轮扫描它才会挪到"已知网络"。
+     * 两趟遍历分别画两组，组内顺序沿用 net_wifi 给的（信号降序）。 */
+    int saved_n = 0;
+    for (int k = 0; k < s_w_apn; k++) {
+        s_w_aps[k].saved = net_wifi_is_saved(s_w_aps[k].ssid);
+        if (s_w_aps[k].saved) {
+            saved_n++;
+        }
+    }
+
+    int y = 0;
+
+    if (saved_n > 0) {
+        wifi_group_title(s_w_list, y, W_KNOWN);
+        y += WIFI_GROUP_H;
+
+        int left = saved_n;
+        for (int i = 0; i < s_w_apn; i++) {
+            if (!s_w_aps[i].saved) {
+                continue;
+            }
+            wifi_list_row(s_w_list, y, i, connected);
+            if (--left > 0) {
+                row_sep(s_w_list, y + WIFI_ROW_H - 1, 852, 44);
+            }
+            y += WIFI_ROW_H;
+        }
+    }
+
+    if (saved_n < s_w_apn) {
+        wifi_group_title(s_w_list, y, W_OTHER);
+        y += WIFI_GROUP_H;
+
+        int left = s_w_apn - saved_n;
+        for (int i = 0; i < s_w_apn; i++) {
+            if (s_w_aps[i].saved) {
+                continue;
+            }
+            wifi_list_row(s_w_list, y, i, connected);
+            if (--left > 0) {
+                row_sep(s_w_list, y + WIFI_ROW_H - 1, 852, 44);
+            }
+            y += WIFI_ROW_H;
+        }
+    }
+
+    s_w_drawn_apn  = s_w_apn;
+    s_w_drawn_st   = (int)net_wifi_state();
+    s_w_drawn_scan = net_wifi_scanning();
+    s_w_drawn_sv   = net_wifi_saved_count();
+}
+
+static void build_wifi(lv_obj_t *page)
+{
+    /* ---- 开关 ---- */
+    lv_obj_t *c = card(page, 20, CONTENT_Y, 984, 76, 20);
+
+    lv_obj_t *ic = icon_glyph(c, ICO_WIFI, C_BLUE, &ui_icon_24);
+    lv_obj_align(ic, LV_ALIGN_LEFT_MID, 24, 0);
+
+    lv_obj_t *t = text(c, i18n_t(W_WIFI), UI_F_BASE, C_TXT, 0, 0);
+    lv_obj_align(t, LV_ALIGN_LEFT_MID, 66, 0);
+
+    s_w_sw = lv_switch_create(c);
+    lv_obj_set_size(s_w_sw, 64, 34);
+    lv_obj_align(s_w_sw, LV_ALIGN_RIGHT_MID, -24, 0);
+    lv_obj_set_style_bg_color(s_w_sw, lv_color_hex(0xD5D5DE), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_w_sw, lv_color_hex(C_GREEN), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(s_w_sw, LV_OPA_COVER, LV_PART_MAIN);
+    if (net_wifi_enabled()) {
+        lv_obj_add_state(s_w_sw, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(s_w_sw, wifi_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* ---- 状态行 + 断开 + 扫描 ---- */
+    s_w_state = text(page, "", UI_F_SMALL, C_SUB, 32, 176);
+    lv_obj_set_width(s_w_state, 712);
+    lv_label_set_long_mode(s_w_state, LV_LABEL_LONG_MODE_DOTS);
+
+    /* 断开：连错网络、或不想让它按退避一直重连时的出口。
+     * 只在"已连 / 连接中 / 失败重试中"出现（见 refresh 里的显隐逻辑），
+     * 关闭和空闲时藏起来 —— 常驻一个点了没反应的按钮比不显示更让人困惑。 */
+    s_w_disc = pill(page, 756, 168, 116, 36, C_CARD, LV_OPA_COVER);
+    lv_obj_set_style_border_width(s_w_disc, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(s_w_disc, lv_color_hex(C_LINE), LV_PART_MAIN);
+    lv_obj_add_flag(s_w_disc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_w_disc, wifi_disconnect_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *dl = mk_label(s_w_disc);
+    lv_label_set_text(dl, i18n_t(W_DISCONNECT));
+    lv_obj_set_style_text_font(dl, UI_F_SMALL, LV_PART_MAIN);
+    lv_obj_set_style_text_color(dl, lv_color_hex(C_BLUE), LV_PART_MAIN);
+    lv_obj_center(dl);
+
+    lv_obj_t *btn = pill(page, 884, 168, 120, 36, C_CARD, LV_OPA_COVER);
+    lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(btn, lv_color_hex(C_LINE), LV_PART_MAIN);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn, wifi_scan_cb, LV_EVENT_CLICKED, NULL);
+
+    s_w_scan_lbl = mk_label(btn);
+    lv_label_set_text(s_w_scan_lbl, i18n_t(W_SCAN));
+    lv_obj_set_style_text_font(s_w_scan_lbl, UI_F_SMALL, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_w_scan_lbl, lv_color_hex(C_BLUE), LV_PART_MAIN);
+    lv_obj_center(s_w_scan_lbl);
+
+    /* ---- 网络列表 ---- */
+    text(page, i18n_t(W_AVAILABLE), UI_F_SMALL, C_SUB, 32, 216);
+
+    lv_obj_t *box = card(page, 20, 240, 984, 336, 20);
+
+    s_w_list = plain(box);
+    lv_obj_set_pos(s_w_list, 24, 8);
+    lv_obj_set_size(s_w_list, 936, WIFI_LIST_H);
+    lv_obj_add_flag(s_w_list, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_w_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_w_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_w_list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_bg_opa(s_w_list, LV_OPA_TRANSP, LV_PART_MAIN);
+}
+
 /* 点"语言"进子页。page_show 会压栈，返回时回设置页而不是桌面。 */
 static void lang_open_cb(lv_event_t *e)
 {
@@ -1792,24 +2696,36 @@ static void build_settings(lv_obj_t *page)
     set_row(g, 72, 936, ICO_LANG, i18n_t(SET_LANGUAGE), cur, lang_open_cb, NULL, true, 0);
     y += 144 + 20;
 
+    /* ---- 网络：WiFi 一行（8 + 64 + 8 = 80） ---- */
+    text(page, i18n_t(SET_NETWORK), UI_F_SMALL, C_SUB, 32, y);
+    y += 24;
+
+    lv_obj_t *n = card(page, 20, y, 984, 80, 20);
+    wifi_short_state(cur, sizeof(cur));
+    s_set_wifi_val = set_row(n, 8, 936, ICO_WIFI, i18n_t(W_WIFI), cur,
+                             wifi_open_cb, NULL, true, 0);
+    y += 80 + 20;
+
     /* ---- 关于 ---- */
     text(page, i18n_t(SET_ABOUT), UI_F_SMALL, C_SUB, 32, y);
     y += 24;
 
-    lv_obj_t *a = card(page, 20, y, 984, 96, 20);
-    text(a, APP_NAME, UI_F_BASE, C_TXT, 24, 20);
-    text(a, APP_VERSION, UI_F_SMALL, C_SUB, 24, 56);
-    y += 96 + 20;
+    /* 名字改长（Automatic Firmware Update Tool）之后这张卡压到 76：
+     * 名字 20 号 + 版本 14 号，上下各留 10 px 就够，省下的高度留给下面的说明。 */
+    lv_obj_t *a = card(page, 20, y, 984, 76, 20);
+    text(a, APP_NAME, UI_F_BASE, C_TXT, 24, 10);
+    text(a, APP_VERSION, UI_F_SMALL, C_SUB, 24, 44);
+    y += 76 + 16;
 
     /* ---- 说明 ---- */
-    lv_obj_t *h = card(page, 20, y, 984, 88, 20);
+    lv_obj_t *h = card(page, 20, y, 984, 64, 20);
     lv_obj_t *hint = mk_label(h);
     lv_label_set_text(hint, i18n_t(SET_ABOUT_HINT));
     lv_obj_set_style_text_font(hint, UI_F_SMALL, LV_PART_MAIN);
     lv_obj_set_style_text_color(hint, lv_color_hex(C_SUB), LV_PART_MAIN);
     lv_obj_set_width(hint, 936);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_MODE_WRAP);
-    lv_obj_set_pos(hint, 24, 22);
+    lv_obj_set_pos(hint, 24, 14);
 }
 
 /* 语言子页：单列宽卡，两行选项 */
@@ -1862,9 +2778,9 @@ static void refresh_cb(lv_timer_t *t)
     /* 刷新统计：只在"明显超过正常刷新量"时才打一行，不破坏
      * "日志只在异常/连接变化时输出"的约定。
      *
-     * 阈值 30 次/10 s 的来历：桌面那张 CPU 折线每秒推一个点，
-     * 自带约 10 次/10 s 的刷新，属于正常。超过 3 fps 的重绘才值得看一眼
-     * —— 那通常意味着有对象在被反复 invalidate。 */
+     * 阈值 30 次/10 s ≈ 平均 3 fps。桌面 CPU 折线撤掉之后，静止的主页
+     * 正常应该接近 0 次；一旦稳定超过这个数，基本就是有对象在被反复
+     * invalidate，配合后面的区域坐标能直接定位。 */
     static int64_t s_flush_log_us = 0;
     int64_t now_us = esp_timer_get_time();
     if (s_flush_log_us == 0) {
@@ -1899,24 +2815,12 @@ static void refresh_cb(lv_timer_t *t)
         }
     }
 
-    /* ---- 顶部状态栏（全局，所有页面都显示） ---- */
+    /* ---- 顶部状态栏（全局，所有页面都显示） ----
+     * 现在只有两个网络接口图标，没有文字要更新。 */
     if (s_sb != NULL) {
-        if (devn != s_sb_last_dev) {
-            s_sb_last_dev = devn;
-            char cnt[32];
-            i18n_dev_count(cnt, sizeof(cnt), devn);
-            lv_label_set_text(s_sb_dev, cnt);
-        }
-
-        /* 桌面是深色壁纸用白字，应用页是浅灰底用深字 */
-        bool dark_ui = (s_cur == APP_HOME);
         /* 壁纸改成淡色后，桌面和应用页都用深色字；dark_ui 只留作"配色变过"的判据 */
+        bool dark_ui = (s_cur == APP_HOME);
         uint32_t fg = C_TXT;
-
-        if (dark_ui != s_sb_last_dark) {
-            s_sb_last_dark = dark_ui;
-            lv_obj_set_style_text_color(s_sb_dev, lv_color_hex(fg), LV_PART_MAIN);
-        }
 
         /* 网线图标只在"插拔"或"换页面配色"时重画，避免每 400 ms 刷新一次 */
         int key = (link ? 1 : 0) | (dark_ui ? 2 : 0);
@@ -1925,7 +2829,72 @@ static void refresh_cb(lv_timer_t *t)
             lan_icon_update(link, fg);
         }
 
-        fps_tick();
+        /* WiFi 图标同理，判重放在 wifi_icon_update() 内部 */
+        wifi_icon_update();
+    }
+
+    /* ---- WiFi：设置页那一行 + WiFi 子页 ----
+     * 设置页的行值无论当前在哪一页都要更新：用户在 WiFi 子页连上/断开，
+     * 返回设置页时必须立刻是对的，不能等下一次重建。 */
+    if (s_set_wifi_val != NULL) {
+        char wb[64];
+        wifi_short_state(wb, sizeof(wb));
+        set_txt(s_set_wifi_val, wb);
+    }
+
+    if (s_cur == APP_WIFI) {
+        if (s_w_state != NULL) {
+            char wb[128];
+            wifi_detail_state(wb, sizeof(wb));
+            set_txt(s_w_state, wb);
+        }
+        if (s_w_scan_lbl != NULL) {
+            set_txt(s_w_scan_lbl, i18n_t(net_wifi_scanning() ? W_SCANNING : W_SCAN));
+        }
+
+        /* "断开"只在有意义的状态下露出来。用 has_flag 比对再动对象：
+         * 每 400 ms 无脑 add/remove 会一直触发无效区重绘（主页闪屏的老毛病）。 */
+        if (s_w_disc != NULL) {
+            net_wifi_state_t wst = net_wifi_state();
+            bool need = (wst == NET_WIFI_CONNECTED ||
+                         wst == NET_WIFI_CONNECTING ||
+                         wst == NET_WIFI_FAILED);
+            bool shown = !lv_obj_has_flag(s_w_disc, LV_OBJ_FLAG_HIDDEN);
+            if (shown != need) {
+                if (need) {
+                    lv_obj_remove_flag(s_w_disc, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_add_flag(s_w_disc, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+        }
+
+        /* 开关可能被串口命令改过（wifi on/off），反向同步一次。
+         * 用户刚拨过的这 1.5 s 里跳过：那时 s_enabled 还没跟上，
+         * 跟着同步会把开关弹回原位（见 s_sw_touch_ms 的注释）。 */
+        if (s_w_sw != NULL
+            && esp_timer_get_time() / 1000 - s_sw_touch_ms > 1500) {
+            bool on  = net_wifi_enabled();
+            bool chk = lv_obj_has_state(s_w_sw, LV_STATE_CHECKED);
+            if (on != chk) {
+                if (on) {
+                    lv_obj_add_state(s_w_sw, LV_STATE_CHECKED);
+                } else {
+                    lv_obj_clear_state(s_w_sw, LV_STATE_CHECKED);
+                }
+            }
+        }
+
+        /* 列表只在"条数 / 状态 / 扫描态 / 已知网络条数"变了时才重建。
+         * 最后一项是给"连上成功 → 凭据才进已知网络"这条新规则用的：
+         * 连上的那一拍还没落表，光看状态不会重建，它会一直留在"其他网络"
+         * 里，要等用户手动扫描才归位。 */
+        if (net_wifi_scan_count() != s_w_drawn_apn ||
+            (int)net_wifi_state() != s_w_drawn_st ||
+            net_wifi_saved_count() != s_w_drawn_sv ||
+            net_wifi_scanning() != s_w_drawn_scan) {
+            wifi_fill_list();
+        }
     }
 
     if (s_cur == APP_HOME) {
@@ -2161,6 +3130,12 @@ static void refresh_cb(lv_timer_t *t)
 
         set_txt_fmt(s_in_dev, "%d", devn);
         set_txt_fmt(s_in_ota, "%s %u%%", state_txt(st.state), pct);
+
+        /* CPU：整数变了才写（1 s 采样一次，稳态下几乎不重绘） */
+        if (s_cpu_pct >= 0 && s_cpu_pct != s_in_cpu_shown) {
+            s_in_cpu_shown = s_cpu_pct;
+            set_txt_fmt(s_in_cpu, "%d%%", s_cpu_pct);
+        }
     }
 }
 
@@ -2264,6 +3239,10 @@ static void build_all(void)
     header(s_page[APP_BRIGHT], i18n_t(SET_BRIGHTNESS), NULL);
     build_bright(s_page[APP_BRIGHT]);
 
+    /* WiFi 子页：标题就是 "WiFi" */
+    header(s_page[APP_WIFI], i18n_t(W_WIFI), NULL);
+    build_wifi(s_page[APP_WIFI]);
+
     /* 状态栏最后创建：屏幕的最后一个子对象 → 永远画在页面之上 */
     build_status_bar(scr);
 }
@@ -2275,8 +3254,6 @@ static void ui_app_rebuild(void)
 {
     app_id_t keep = s_cur;
 
-    s_sb_last_dev    = -1;
-    s_sb_last_dark   = false;
     s_dev_sig        = 0;
     s_dev_have_sig   = false;
     s_dev_last_link  = false;
@@ -2284,8 +3261,8 @@ static void ui_app_rebuild(void)
     s_upg_have_sig   = false;
     s_heap_shown     = -1;
     s_in_mem_shown   = -1;
+    s_in_cpu_shown   = -1;
     s_flash_shown    = -1;
-    s_fps_shown      = -1;      /* 帧率 label 是新对象，下次 tick 必须重写 */
     s_arc_shown      = -1;
     s_busy_shown     = -1;
     s_lan_key        = -1;
@@ -2293,10 +3270,9 @@ static void ui_app_rebuild(void)
     s_lan_fg_drawn   = 0;
     s_upg_col_shown  = 0xFFFFFFFFu;
 
-    /* 桌面系统状态：新 label/折线都是新对象，
-     * CPU 文字与 TF 行必须重写；折线的历史由 build_home 里的 seed 灌回去，
-     * 所以环形缓冲 s_cpu_hist 不能清。 */
-    s_home_cpu_shown = -1;
+    /* 桌面卡片：新 label 都是新对象，台数/内存/TF 行必须重写一次 */
+    s_home_online_shown    = -1;
+    s_home_devoff_shown    = -1;
     s_home_mem_shown = -1;
     s_tf_shown       = -2;
 
@@ -2307,13 +3283,39 @@ static void ui_app_rebuild(void)
     s_br_pct     = NULL;
     s_set_br_val = NULL;
 
-    /* 桌面系统状态的对象也会被 lv_obj_clean 删掉 */
-    s_home_chart   = NULL;
-    s_home_cpu_ser = NULL;
-    s_home_cpu_pct = NULL;
+    /* 升级页的标题 label 会被隐/显切换，重建后必须先清掉旧指针 */
+    s_upg_hdr    = NULL;
+
+    /* 桌面右侧卡片的 label 也会被 lv_obj_clean 删掉 */
+    s_home_online    = NULL;
+    s_home_dev_off   = NULL;
     s_home_mem_pct = NULL;
     s_home_mem_bar = NULL;
     s_home_tf      = NULL;
+
+    /* WiFi 子页同理。注意密码浮层现在挂在 lv_layer_top() 上，
+     * lv_obj_clean(screen) 清不到它，必须显式删掉再清指针 ——
+     * 留着的话 swipe_poll 会一直认为"浮层开着"，整机侧滑返回永久失效。 */
+    s_w_sw         = NULL;
+    s_w_state      = NULL;
+    s_w_scan_lbl   = NULL;
+    s_w_disc       = NULL;
+    s_w_list       = NULL;
+    s_set_wifi_val = NULL;
+    close_password();
+    s_pw_modal     = NULL;
+    s_pw_ta        = NULL;
+    s_pw_kb        = NULL;
+    s_w_drawn_apn  = -1;
+    s_w_drawn_st   = -1;
+    s_w_drawn_scan = false;
+    s_w_drawn_sv   = -1;
+    /* 状态栏对象会被 lv_obj_clean() 删掉，指针必须一起清：
+     * 只把 s_wifi_lvl 复位成 -1 是不够的，wifi_icon_update() 若在这一帧
+     * 被调到，lvl(-1) != 新档位就会去操作已释放的 s_wifi。 */
+    s_wifi         = NULL;
+    s_wifi_slash   = NULL;
+    s_wifi_lvl     = -1;        /* 状态栏是新对象：wifi_icon_create() 会重设 */
 
     lv_obj_clean(lv_screen_active());
     build_all();
@@ -2356,11 +3358,10 @@ esp_err_t ui_app_start(void)
     lv_timer_create(refresh_cb, 400, NULL);
     lv_timer_create(swipe_poll_cb, 30, NULL);   /* 滑动返回：30 ms 轮询指针位移 */
 
-    /* 帧率计数：挂在 display 上而不是 screen 上 —— screen 会被 rebuild 清掉，
+    /* 刷新统计：挂在 display 上而不是 screen 上 —— screen 会被 rebuild 清掉，
      * display 的生命周期才是整个应用。也只在这里注册一次。 */
     lv_display_t *disp = lv_display_get_default();
     if (disp != NULL) {
-        lv_display_add_event_cb(disp, disp_frame_cb, LV_EVENT_RENDER_READY, NULL);
         lv_display_add_event_cb(disp, disp_flush_stat_cb, LV_EVENT_FLUSH_START, NULL);
     }
 

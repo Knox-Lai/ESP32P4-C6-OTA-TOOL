@@ -26,6 +26,22 @@ if (-not (Test-Path $eimProfile)) {
 Write-Host "[env] activating ESP-IDF v6.1 (IDF_PATH=D:\esp\.espressif\v6.1\esp-idf)" -ForegroundColor Cyan
 . $eimProfile
 
+# 组件缓存目录默认在 %LOCALAPPDATA%\Espressif\ComponentManager\Cache，路径本身就有 76 字符，
+# esp_hosted 的 examples/power_save/host+cp/network_split__... 一叠下去会超过 Windows 的
+# 260 字符上限（实测解压目标 265），zipfile 直接抛 FileNotFoundError。
+# C:\idfc 是指向原缓存目录的 junction，既缩短前缀又不丢已下载组件；
+# 这里显式设置是为了不依赖用户在终端里改过环境变量（setx 只对新进程生效）。
+if (-not $env:IDF_COMPONENT_CACHE_PATH) {
+    if (Test-Path "C:\idfc") {
+        $env:IDF_COMPONENT_CACHE_PATH = "C:\idfc"
+    } else {
+        Write-Host "[env] 警告：C:\idfc 不存在，组件缓存将走默认长路径，esp_hosted 可能解压失败" -ForegroundColor Yellow
+    }
+}
+if ($env:IDF_COMPONENT_CACHE_PATH) {
+    Write-Host "[env] IDF_COMPONENT_CACHE_PATH=$env:IDF_COMPONENT_CACHE_PATH" -ForegroundColor Cyan
+}
+
 Set-Location -Path $PSScriptRoot
 
 # set-target wipes sdkconfig and build/, so only run it when the target is wrong.

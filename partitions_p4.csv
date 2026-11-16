@@ -15,10 +15,16 @@
 #   0x11000   24K   nvs
 #   0x17000    4K   phy_init
 #   0x20000    6M   factory   —— 应用本体（LVGL + UI）
-#   0x620000   8M   storage   —— 固件仓库（导出的待升级固件），阶段 7 使用
+#   0x620000   8M   storage   —— 固件仓库（.fwp），阶段 7 使用
+#
+# storage 用 fat 而不是 spiffs：
+#   fw_store 要把 1~4 MB 的 .fwp 写进去，spiffs 无目录、文件名上限 32 B、
+#   大文件 GC 抖动明显；fat + 磨损均衡（esp_vfs_fat_spiflash_mount_rw_wl）
+#   与 TF 卡共用同一套 POSIX 接口，且能用 .part → rename 做原子入库。
+#   首次挂载会自动格式化（format_if_mount_failed=true）。
 #
 # Name,     Type, SubType, Offset,    Size,      Flags
 nvs,        data, nvs,     0x11000,   0x6000,
 phy_init,   data, phy,     0x17000,   0x1000,
 factory,    app,  factory, 0x20000,   0x600000,
-storage,    data, spiffs,  0x620000,  0x800000,
+storage,    data, fat,     0x620000,  0x800000,

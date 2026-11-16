@@ -28,12 +28,14 @@
 #include "app_config.h"
 #include "net_eth.h"
 #include "net_dhcps.h"
+#include "net_wifi.h"
 #include "dev_discovery.h"
 #include "dev_table.h"
 #include "ota_client.h"
 #include "ota_shell.h"
 #include "bsp_display.h"
 #include "bsp_sdcard.h"
+#include "fw_store.h"
 #include "sys_clock.h"
 #include "ui_app.h"
 
@@ -208,6 +210,15 @@ void app_main(void)
     /* 0.5) TF 卡：后台任务异步挂载，不阻塞启动。
      *      放这里是为了让桌面第一帧就有机会读到卡状态（没插就显示"未插入"）。 */
     bsp_sdcard_init();
+
+    /* 0.6) 固件仓库：挂内部 storage 分区（FAT+WL）并起后台扫描。
+     *      首次挂载会格式化 8 MB 分区，耗时放在自己的任务里，不拖启动。 */
+    fw_store_init();
+
+    /* 0.7) WiFi：只读 NVS 里的开关与凭据就返回，真正的 esp_wifi_init
+     *      （要跟 C6 走一遍 SDIO 握手，最坏几秒）在自己的任务里做，
+     *      不能拖慢第一帧。必须在 esp_netif_init 之后。 */
+    net_wifi_init();
 
     /* 1) 建 netif（带 ESP_NETIF_DHCP_SERVER 标志）与驱动 */
     ESP_ERROR_CHECK(net_eth_init());

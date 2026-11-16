@@ -1,20 +1,25 @@
 idf_component_register(
-    SRCS "bsp_sdcard.c" "app_main.c"
-         "net_eth.c"
-         "net_dhcps.c"
-         "ota_frame.c"
-         "ota_proto.c"
-         "ota_sha256.c"
-         "ota_image.c"
-         "ota_client.c"
-         "ota_shell.c"
-         "dev_table.c"
-         "dev_discovery.c"
+    # 源文件按字母序，避免同一文件重复登记（CMake 会静默去重，但列表会越来越乱）
+    SRCS "app_main.c"
          "bsp_display.c"
          "bsp_sdcard.c"
-         "ui_app.c"
+         "dev_discovery.c"
+         "dev_model.c"
+         "dev_table.c"
+         "fw_pkg.c"
+         "fw_store.c"
          "i18n.c"
+         "net_dhcps.c"
+         "net_eth.c"
+         "net_wifi.c"
+         "ota_client.c"
+         "ota_frame.c"
+         "ota_image.c"
+         "ota_proto.c"
+         "ota_sha256.c"
+         "ota_shell.c"
          "sys_clock.c"
+         "ui_app.c"
          # 生成的字库（tools/fontgen/gen_fonts.py 产出）：
          #   HarmonyOS Sans SC Medium 子集（16/22/30 px）+ iconfont 子集。
          # 改了 i18n.c 里的中文文案后必须重跑脚本，否则新字会直接显示成方块。
@@ -54,9 +59,15 @@ idf_component_register(
     #   esp_driver_sdmmc : SDMMC 主机驱动（SDMMC_HOST_DEFAULT / 槽位配置）
     #   sdmmc            : sd_pwr_ctrl_by_on_chip_ldo.h（片内 LDO 给卡供电）
     #   fatfs            : esp_vfs_fat_sdmmc_mount / esp_vfs_fat_info
+    # 阶段 10 固件仓库（fw_store.c）：
+    #   wear_levelling   : esp_vfs_fat_spiflash_mount_rw_wl（storage 分区 FAT + WL）
+    # WiFi（net_wifi.c）：
+    #   esp_wifi         : esp_wifi.h / esp_wifi_default.h。P4 上没有本地射频，
+    #                      该组件按 CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED 编译成
+    #                      "转发给 C6" 的远程实现，头文件与 API 与本地完全一致。
     REQUIRES esp_eth esp_netif esp_event lwip esp_timer esp_driver_uart
              esp_driver_usb_serial_jtag esp_common log freertos nvs_flash
              esp_lcd esp_lcd_jd9165 esp_lcd_touch esp_lcd_touch_gt911
              esp_lvgl_port lvgl esp_driver_ledc esp_driver_i2c esp_hw_support
-             spi_flash esp_driver_sdmmc sdmmc fatfs
+             spi_flash esp_driver_sdmmc sdmmc fatfs wear_levelling esp_wifi
 )

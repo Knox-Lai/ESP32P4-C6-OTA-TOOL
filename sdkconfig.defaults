@@ -33,6 +33,13 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_FREERTOS_HZ=1000
 
+# FreeRTOS 运行统计：主页 CPU 折线靠 uxTaskGetSystemState() 统计全部任务。
+# 这两项原来是直接在 sdkconfig 里点开的（没进 defaults），
+# 一旦为了新增组件重生成 sdkconfig 就会丢，界面会编译不过 —— 所以补写在这里。
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
+
 # DHCP Server：ETH netif 上跑 DHCP 依赖这一项（默认 y，显式写出避免被别的配置带偏）
 CONFIG_LWIP_DHCPS=y
 CONFIG_LWIP_DHCPS_REPORT_CLIENT_HOSTNAME=y
@@ -56,3 +63,14 @@ CONFIG_LV_DEF_REFR_PERIOD=15
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_LV_FONT_MONTSERRAT_28=y
+
+# ---------------- WiFi（P4 主机 + 板载 C6 从机，esp_hosted） ----------------
+# P4 没有射频，esp_wifi 的库实现必须走远程（RPC 到 C6），不能选本地。
+CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=y
+# 从机型号：不写默认不是 C6，esp_hosted 会按错误的目标去准备 slave 固件。
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+# SDIO 引脚用 esp_hosted 默认值，与本板 C6 连线一致：
+#   CLK=18  CMD=19  D0=14 D1=15 D2=16 D3=17  RESET=54  slot=1  4bit 40MHz
+# slot1 不能和 TF 卡（SDMMC slot0）抢同一个控制器。
+# 若某天换板子，只改 CONFIG_ESP_HOSTED_HOST_SDIO_PIN_* / _RESET_GPIO 即可。
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y

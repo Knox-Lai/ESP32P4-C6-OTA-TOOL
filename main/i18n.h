@@ -138,6 +138,51 @@ typedef enum {
     H_TF,
     H_TF_NONE,
 
+    /* 设置 → WiFi 子页（同样追加在末尾，避免整表错位）
+     * 这些字符串里的汉字会被 gen_fonts.py 收进中文字库子集。 */
+    SET_NETWORK,          /* "网络"分组标题 */
+    W_WIFI,               /* 行标题 / 子页标题，内容就是 "WiFi" */
+    W_AVAILABLE,          /* "可用网络"列表标题 */
+    W_ON,
+    W_OFF,
+    W_SCANNING,
+    W_CONNECTING,
+    W_CONNECTED,
+    W_NOT_CONNECTED,
+    W_FAILED,
+    W_UNAVAILABLE,
+    W_OPEN,               /* 开放网络（无密码） */
+    W_PASSWORD,
+    W_CONNECT,
+    W_CANCEL,
+    W_DISCONNECT,
+    W_FORGET,
+    W_HINT,
+    W_NO_AP,
+    W_SAVED,              /* 已保存标记 */
+    W_SCAN,               /* 扫描按钮 */
+    W_KNOWN,              /* 列表分组"已知网络" */
+    W_OTHER,              /* 列表分组"其他网络" */
+    W_RETRYING,           /* 失败后自动重连中的提示 */
+
+    /* 桌面右侧"设备"卡片（追加在末尾，保持前面的枚举不移位） */
+    H_DEVICES,            /* 卡片标题 */
+    H_DEV_ONLINE,         /* 大号数字下面的说明 */
+    H_DEV_OFFLINE_FMT,    /* "N 台离线"（没有离线设备时整条隐藏） */
+
+    /* WiFi 失败原因（对应 net_wifi_err_t，追加在末尾不打乱前面的索引）。
+     * 只有 OTHER 才退回 W_FAILED 那句通用"连接失败"。 */
+    W_ERR_PASSWORD,       /* 密码错（含四次握手超时） */
+    W_ERR_NO_AP,          /* 找不到该 AP */
+    W_ERR_REJECTED,       /* AP 拒绝连接 */
+    W_ERR_TIMEOUT,        /* 驱动无响应，本地超时 */
+    W_ERR_LINK_LOST,      /* 连上之后链路断开 */
+    W_RETRY_REASON_FMT,   /* "%s，正在重试…" —— 保留原因，别退回一句 retrying */
+    W_ERR_STOPPED_FMT,    /* "%s，已停止重试" —— 重连预算用尽（对应 net_wifi_retry_pending） */
+
+    /* 忘记单个已知网络的确认框（长按列表行触发） */
+    W_FORGET_TITLE,       /* "忘记网络" */
+
     I18N_STR_MAX
 } i18n_str_t;
 
@@ -180,6 +225,22 @@ typedef enum {
 #define ICO_LANG_EN     "\xEE\xAF\xA0"   /* ebe0 英文        */
 #define ICO_LANG_ZH     "\xEE\xAF\xA2"   /* ebe2 中文        */
 #define ICO_BRIGHT      "\xEE\x9A\x98"   /* e698 brightness（亮度行 / 亮度子页的太阳） */
+#define ICO_WIFI        "\xEE\x9F\xA0"   /* e7e0 wifi（状态栏 / 设置里的 WiFi 行） */
+
+/* e6a1-e6a4：状态栏用的 4 档信号强度字形，由设计稿的 4 个 SVG
+ * （design/icon/a-wifixinhaoqiangdu1..4.svg）生成，见 tools/fontgen/gen_fonts.py。
+ *
+ * 为什么不直接用下载来的 signal-1..4（e646-e649）：那些 SVG 确实分了层
+ * （点亮部分彩色、未点亮 #DDDCDC），但**iconfont.ttf 把四个变体压成了
+ * 同一个轮廓**（bbox 全等、逐像素 diff=0），从 ttf 里取只能拿到满格图形。
+ * 所以生成脚本直接读 SVG，按 fill 滤掉 #DDDCDC 取点亮部分，再写成
+ * e6a1-e6a4 四个字形。
+ *
+ * 四档分别是只有点 / 点+1 弧 / 点+2 弧 / 全部，底边对齐、水平居中。 */
+#define ICO_SIG1        "\xEE\x9A\xA1"   /* e6a1 一格：只有中心点 */
+#define ICO_SIG2        "\xEE\x9A\xA2"   /* e6a2 两格：点 + 内弧     */
+#define ICO_SIG3        "\xEE\x9A\xA3"   /* e6a3 三格：点 + 两条弧   */
+#define ICO_SIG4        "\xEE\x9A\xA4"   /* e6a4 四格：完整 wifi     */
 
 /* ---------------- API ---------------- */
 
