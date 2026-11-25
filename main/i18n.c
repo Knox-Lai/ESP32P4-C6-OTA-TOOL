@@ -87,8 +87,12 @@ static const char *const k_str[I18N_STR_MAX][2] = {
 /* I_LEASE           */ { "ASSIGNED IP",                              "已分配 IP" },
 /* I_SYSTEM          */ { "SYSTEM",                                   "系统" },
 /* I_RAM             */ { "INTERNAL RAM",                             "内部 RAM 占用" },
-/* I_RAM_DETAIL      */ { "free %u KB  /  %u KB",                     "空闲 %u KB  /  共 %u KB" },
+/* I_RAM_USED_FMT    */ { "used %u",                                   "已用 %u" },
+/* I_RAM_SYS_FMT     */ { "sys %u",                                    "系统 %u" },
+/* I_RAM_FREE_FMT    */ { "free %u",                                   "空闲 %u" },
+/* I_RAM_TOTAL_FMT   */ { "of %u KB",                                  "共 %u KB" },
 /* I_PSRAM           */ { "PSRAM",                                    "PSRAM" },
+/* I_PSRAM_FMT       */ { "used %u MB / %u MB",                       "已用 %u MB / 共 %u MB" },
 /* I_FLASH           */ { "FLASH",                                    "闪存容量" },
 /* I_MIN_HEAP        */ { "LOWEST FREE RAM",                          "历史最低空闲" },
 /* I_UPTIME          */ { "UPTIME",                                   "运行时间" },
@@ -249,10 +253,21 @@ const lv_font_t *i18n_font(ui_txt_size_t size)
         }
     }
 
+    /* 英文：SF Pro Text Regular 子集（tools/fontgen 产出）。
+     * 不用 LVGL 内置 Montserrat 的原因：字面更宽、笔画端点更圆，和设计稿
+     * 的 iOS 观感差一截；换成 SF 之后中英两套都是"苹果风"，切语言时字形
+     * 气质一致（只剩字号 14/20/28 与 16/22/30 的差别）。
+     *
+     * 用 Text 而不是 Display：苹果的分工是 20 px 以下 Text、以上 Display。
+     * 本界面主力是 14 / 20 两档，Display 那版实测发虚发小，Text 的
+     * x-height 更高、小字 hinting 更好。28 px 只有百分比在用，松一点无所谓。
+     *
+     * 注意这套字体**只有 ASCII**：没有 · ° • 这类符号，也没有 LV_SYMBOL_*。
+     * 英文文案里出现任何非 ASCII 都会画成方框，改文案时只能写纯 ASCII。 */
     switch (size) {
-    case UI_TXT_LARGE: return &lv_font_montserrat_28;
-    case UI_TXT_BASE:  return &lv_font_montserrat_20;
-    default:           return &lv_font_montserrat_14;
+    case UI_TXT_LARGE: return &ui_font_en_28;
+    case UI_TXT_BASE:  return &ui_font_en_20;
+    default:           return &ui_font_en_14;
     }
 }
 

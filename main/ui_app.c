@@ -34,6 +34,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs.h"            /* 亮度偏好持久化（命名空间 "ui"，与语言同一个） */
+#include "soc/soc.h"        /* SOC_DRAM_LOW/HIGH：信息页内存条的 768 KB 全长 */
 
 #include "lvgl.h"
 
@@ -74,6 +75,13 @@ static const char *TAG = "ui";
 #define C_ORANGE     0xFF9F0A
 
 #define CONTENT_Y    92            /* 应用页内容起始 y */
+
+/* 信息页内存条的全长。取硬件 SRAM 窗（P4 是 0x4ff00000~0x4ffc0000 = 768 KB），
+ * 而不是 heap_caps 统计到的堆总量（约 462 KB）：两者差的那 300 KB 是
+ * 静态段 + 启动预留，它确实占着内存、也确实不能给应用用 —— 按 768 画全长
+ * 才能把这一段单独涂成灰色显示出来，而不是让它凭空消失。 */
+#define UI_RAM_HW_KB  ((unsigned)((SOC_DRAM_HIGH - SOC_DRAM_LOW) / 1024))
+#define UI_MEM_BAR_W  436         /* 卡片内宽 484 - 左右各 24 */
 
 /* ---------------- 状态 ---------------- */
 typedef enum {
@@ -127,11 +135,6 @@ static lv_obj_t *s_home_mem_pct = NULL;
 static lv_obj_t *s_home_mem_bar = NULL;
 static lv_obj_t *s_home_tf      = NULL;
 
-/* CPU 采样：每秒一次，只为信息页那一行服务（页面不在时不写文字） */
-#define CPU_TASK_MAX  48            /* 任务数上限，uxTaskGetSystemState 的数组长度 */
-static int       s_cpu_pct    = -1; /* 最近一次算出的 CPU 占用率，-1 = 还没有 */
-static int64_t   s_cpu_next_us = 0; /* 下一次采样的时间戳 */
-
 /* 设备列表 */
 static lv_obj_t *s_dev_list  = NULL;
 static lv_obj_t *s_dev_count = NULL;
@@ -165,9 +168,9 @@ static bool      s_upg_have_sig = false;
 
 /* 信息页 */
 static lv_obj_t *s_in_ip, *s_in_mask, *s_in_gw, *s_in_link, *s_in_lease;
-static lv_obj_t *s_in_mem_pct, *s_in_mem_bar, *s_in_mem_sub, *s_in_psram;
-static lv_obj_t *s_in_flash, *s_in_min, *s_in_up, *s_in_dev, *s_in_ota;
-static lv_obj_t *s_in_cpu = NULL;   /* CPU 占用率（桌面折线撤掉后落在这一页） */
+static lv_obj_t *s_in_mem_pct, *s_in_mem_sub, *s_in_psram;
+static lv_obj_t *s_in_mem_res, *s_in_mem_used;   /* 768 KB 条里的"系统预留"/"堆已用"两段 */
+static lv_obj_t *s_in_flash, *s_in_min, *s_in_up;
 
 /* ---- 背光亮度 ----
  * 0~100 (%)，写在 NVS（命名空间 "ui"，key "bright"，和语言同一个命名空间）。
@@ -227,7 +230,6 @@ static char      s_pw_ssid[NET_WIFI_SSID_MAX];
 static int      s_heap_shown     = -1;          /* 桌面空闲内存（8 KB 死区） */
 static int      s_in_mem_shown   = -1;          /* 信息页内部 RAM 占用率 % */
 static int      s_flash_shown    = -1;          /* 信息页 Flash 容量（-1 未读，只读一次） */
-static int      s_in_cpu_shown   = -1;          /* 信息页 CPU 占用率 %（桌面折线撤掉后挪到这里） */
 static int      s_home_mem_shown = -1;          /* 桌面内存条百分比 */
 static int      s_tf_shown       = -2;          /* 桌面 TF 行：-2 未画，-1 无卡，1 有卡 */
 static int      s_arc_shown      = -1;          /* 升级页进度环 */
@@ -357,18 +359,19 @@ static lv_obj_t *icon_glyph(lv_obj_t *parent, const char *utf8, uint32_t color,
 static lv_obj_t *s_lan   = NULL;
 static lv_obj_t *s_slash = NULL;    /* 断开时压上去的斜杠（旋转 45° 的细条） */
 
-/* 斜杠本体：3 x 24 的圆角竖条，绕自身中心顺时针转 45° 就是 "/"。
- * 转 45° 后对角跨度 ≈ (24 + 3) × 0.707 ≈ 19 px，正好盖过 18 px 的图标 ink，
- * 两端各露出一点点，看起来才是"划掉"而不是"图标上贴了个点"。
+/* 斜杠本体：3 x 26 的圆角竖条，绕自身中心顺时针转 45° 就是 "/"。
+ * 转 45° 后对角跨度 ≈ (26 + 3) × 0.707 ≈ 20.5 px，比 18 px 的图标 ink
+ * 长出一点，两端才都露出纸面，看起来是"划掉"而不是"图标上贴了个点"。
+ * 26 而不是 24：24 时左下那端刚好卡在 ink 边缘上，视觉上像被切掉一截。
  *
  * pivot 必须显式设成对象中心：LVGL 的 transform 默认绕**左上角**转，
- * 3×24 的条绕 (0,0) 转 45° 后几何中心会跑到 (-7.4, 9.5)，
+ * 3×26 的条绕 (0,0) 转 45° 后几何中心会跑到 (-8.1, 10.3)，
  * 也就是左偏 9 px、上移 2.5 px —— 这就是"斜杠没经过图标正中间"的原因，
  * 跟布局和字体都无关。 */
 static lv_obj_t *lan_slash(lv_obj_t *parent)
 {
     lv_obj_t *o = plain(parent);
-    lv_obj_set_size(o, 3, 24);
+    lv_obj_set_size(o, 3, 26);
     lv_obj_set_style_radius(o, 2, LV_PART_MAIN);
     lv_obj_set_style_bg_color(o, lv_color_hex(C_SUB), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(o, LV_OPA_COVER, LV_PART_MAIN);
@@ -385,9 +388,11 @@ static void lan_icon_create(lv_obj_t *parent)
     lv_obj_align(s_lan, LV_ALIGN_TOP_RIGHT, -18, 2);
 
     /* 斜杠压在图标中心：底图 24 px 字形，ink 约 18 px，
-     * 斜杠转 45° 后跨度约 19 px，横穿整个图标。 */
+     * 斜杠转 45° 后跨度约 20.5 px，横穿整个图标。
+     * 中心故意下移 1 px：条长 26、两端已经对称多出 1 px，再整体下移 1 px
+     * 就变成"右上端维持原位、左下端多伸 2 px"，斜杠左下那截才划得出去。 */
     s_slash = lan_slash(parent);
-    lv_obj_align_to(s_slash, s_lan, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align_to(s_slash, s_lan, LV_ALIGN_CENTER, 0, 1);
 }
 
 static void lan_icon_update(bool up, uint32_t fg)
@@ -411,35 +416,103 @@ static void lan_icon_update(bool up, uint32_t fg)
 
 /* 状态栏右上角的 WiFi 图标，排在网线图标左侧。
  *
- * 语义和网线图标完全一致（用户要"没连上就被划掉"，而不是整个消失）：
- *   已连接（拿到 IP） → 按信号档位换字形，无斜杠；
- *   关闭 / 未连 / 连接中 / 失败 / 硬件不可用 → 灰 wifi + 斜杠。
+ * 语义和网线图标一致（没连上就被划掉，而不是整个消失）：
+ *   已连接（拿到 IP） → 按信号档位点亮弧线，无斜杠；
+ *   关闭 / 未连 / 连接中 / 失败 / 硬件不可用 → 全灰 + 斜杠。
  *
- * 信号强度用**换字形**表达：1 档只有中心点，2 档点 + 一条弧，3 档两条，
- * 4 档完整 wifi。字库里的 e6a1-e6a4 就是为此生成的。
+ * 信号强度用**自绘的同心弧**表达：档位 1 只有底部圆点，2/3/4 依次多点亮
+ * 一段弧（内 → 外），一共 4 个可亮单元，正好对应 4 档。
  *
- * 走过的弯路记一下，别再回头：
- *   ① 图标左侧加四段竖条 —— 用户否（"这样不好"）；
- *   ② 用 lv_arc 自绘点 + 三条同心弧 —— 用户否（"太丑了"），自绘怎么调
- *      参数都不如字形耐看；
- *   ③ 只留原字形、靠颜色深浅 —— 一个 24 px 字形只有颜色一个维度，
- *      四档灰在这块屏上分不出来；
- *   ④ 用户下载了 signal-1..4（e646-e649）想直接用 —— 但 ttf 里这四个码位
- *      被压成了同一个图形，直接用等于没分级。
- *
- * 于是现在这版：直接吃设计稿的 4 个 SVG（a-wifixinhaoqiangdu1..4.svg，
- * 每个文件里"点亮"的部分是彩色 fill、未点亮的是 #DDDCDC），按 fill 过滤
- * 就拿到 1/2/3/4 档各自的轮廓，生成 e6a1-e6a4 四个真字形（见
- * tools/fontgen/gen_fonts.py 的 add_signal_glyphs）。换档时只改 label 的
- * 文字。四档 advance 都是 1024、ink 水平居中、底边对齐，所以换字形时
- * 图标不会横跳也不会上下蹦。 */
+ * 画法演变（前三版都否决过，记下来免得再绕回去）：
+ *   ① 图标左侧加四段竖条 —— 否（"这样不好"）；
+ *   ② lv_arc 控件叠三层 —— 否（"太丑了"）：控件自带背景/指示器/knob，
+ *      每层都要单独关，三层半径还得互相对齐，参数一多就调不动；
+ *   ③ 换成设计稿导出的四档字形（e6a1-e6a4）—— 效果可以，但每加一档就要
+ *      重新生成字库，且强弱只能离散到 4 挡。
+ *   现在：直接在 layer 上画 lv_draw_arc。只有"圆心 / 半径 / 线宽"三个量，
+ *   圆头和抗锯齿是现成的，改档位只需改一个整数。 */
 
 static lv_obj_t *s_wifi       = NULL;
 static lv_obj_t *s_wifi_slash = NULL;
-static int       s_wifi_lvl   = -1;   /* 上次画的档位，0 = 未连接，-1 = 没画过 */
+static int       s_wifi_lvl   = -1;   /* 档位：0 = 未连接，1..4 = 亮几个单元，-1 = 没画过 */
 
-/* 档位 → 字形。下标 0 对应 1 格，和 wifi_sig_level() 的返回值减一对应。 */
-static const char *const s_wifi_glyph[4] = { ICO_SIG1, ICO_SIG2, ICO_SIG3, ICO_SIG4 };
+/* 尺寸与网线图标同占 24×24；圆心在底部中点，三段弧同心、最外一段撑满宽度。 */
+#define WIFI_ICO_W      24
+#define WIFI_ICO_H      24
+#define WIFI_ICO_CX     12     /* 圆心 x（对象内坐标） */
+#define WIFI_ICO_CY     19     /* 圆心 y：圆点在底部，弧往上长 */
+#define WIFI_ICO_LW     2      /* 线宽：设计稿 1024 网格里是 70.3，换算到 24 px = 1.65，
+                                * 只能用整数，取 2 —— 1 px 在屏上会被抗锯齿吃掉。 */
+/* 圆点相对圆心（三段弧的同心点）的纵向偏移。
+ * 设计稿里圆点是和弧同心的，但 24 px 等比缩放后，圆点底边离图标下沿只剩
+ * 4 px、离内弧内缘（cy - 5）却有 3 px，看起来"点掉在下面、和弧脱开"。
+ * 上移 1 px 让间隙变 2 px，四档整体的视觉重心更紧凑。
+ * 不要再往上（2 px 起）：圆点 3 px 高、弧 2 px 宽，间隙缩到 1 px 后抗锯齿
+ * 会把两者糊成一根，档位 1（只有圆点）就和档位 2（圆点 + 内弧）分不开了。 */
+#define WIFI_ICO_DOT_DY (-1)
+
+/* 三段弧半径（lv_draw_arc 的 radius 是**外**半径，线往里长）。
+ * 设计稿 a-wifixinhaoqiangdu*.svg 以 (512, 815.9) 为心，三段内缘半径
+ * 267.8 / 468.4 / 609.2，按 24/1024 缩放并加一个线宽，得到 7 / 11 / 15，
+ * 内缘正好 5 / 9 / 13，弧间距均匀。不要随手改成等距的小半径：
+ * 半径越小，弧顶越平，四档的层次就越分不出来。 */
+static const uint16_t s_wifi_arc_r[3] = { 7, 11, 15 };
+
+/* 自绘回调：三段同心弧 + 底部圆点。
+ *
+ * 不用 lv_draw_line 折线：24 px 的图标上，三个点连成的"弧"在转折处会露出
+ * 明显棱角，半径越小越像尖顶房子；把采样点加密又变成几十次绘制调用。
+ * lv_draw_arc 一次调用就是一段真弧，边缘自带抗锯齿。 */
+static void wifi_draw_cb(lv_event_t *e)
+{
+    lv_layer_t *layer = lv_event_get_layer(e);
+    lv_area_t   c;
+    lv_obj_get_coords(lv_event_get_target(e), &c);
+
+    const int32_t cx = c.x1 + WIFI_ICO_CX;
+    const int32_t cy = c.y1 + WIFI_ICO_CY;
+
+    const bool linked = (s_wifi_lvl > 0);
+    /* 亮段用正文色、暗段浅灰；未连接时整体转灰，由斜杠表达"断开"。
+     * 已连接却画成灰的会被当成没连，所以这两者不能共用一套颜色。 */
+    const uint32_t on  = linked ? C_TXT : C_SUB;
+    const uint32_t off = linked ? 0xC7C7CE : C_SUB;
+
+    lv_draw_arc_dsc_t ad;
+    lv_draw_arc_dsc_init(&ad);
+    ad.width   = WIFI_ICO_LW;
+    ad.center  = (lv_point_t){ .x = cx, .y = cy };
+    /* 端头用平切（rounded = 0）：设计稿的弧端就是沿径向 45° 切平的，
+     * 圆头会在端点鼓出一个和线宽同直径的球，24 px 上像"糖葫芦"。 */
+    ad.rounded = 0;
+    /* 顶部 90° 弧：0° 在 3 点钟、90° 在 6 点钟（顺时针为正，
+     * 见 lv_draw_arc.h 里 start_angle 的注释），所以 12 点钟是 270°，
+     * 左右各张 45° 就是 225° → 315°。
+     *
+     * 千万别写成 -135 / -45：lv_draw_sw_mask_angle_init() 会把负角度
+     * 直接钳成 0（`if(start_angle < 0) start_angle = 0;`），两个都变 0 之后
+     * start == end，角度掩码退化成全放行，画出来是一整圈同心圆环。 */
+    ad.start_angle = 225;
+    ad.end_angle   = 315;
+
+    for (int i = 0; i < 3; i++) {          /* i=0 内弧，i=2 外弧 */
+        ad.radius = s_wifi_arc_r[i];
+        /* 档位 1 只亮圆点；2/3/4 依次多点一段弧 */
+        ad.color = lv_color_hex(s_wifi_lvl >= i + 2 ? on : off);
+        lv_draw_arc(layer, &ad);
+    }
+
+    lv_draw_rect_dsc_t rd;
+    lv_draw_rect_dsc_init(&rd);
+    rd.bg_color = lv_color_hex(linked ? on : off);
+    rd.bg_opa   = LV_OPA_COVER;
+    rd.radius   = LV_RADIUS_CIRCLE;
+    /* 圆点 3×3：设计稿半径 70.3/1024 → 1.65 px，直径 3.3，取 3 最接近
+     * （原来 4×4 的实心方块面积是它的两倍，看着像颗痣） */
+    const int32_t dy = cy + WIFI_ICO_DOT_DY;
+    const lv_area_t dot = { cx - 1, dy - 1, cx + 1, dy + 1 };
+    lv_draw_rect(layer, &rd, &dot);
+}
 
 /* 信号档位定义在 WiFi 列表那段（同一套阈值两处共用），
  * 状态栏的档数必须和列表里的格数一致，否则同一个信号两块地方说不同的话。 */
@@ -447,25 +520,28 @@ static int wifi_sig_level(int8_t rssi);
 
 static void wifi_icon_create(lv_obj_t *parent)
 {
-    /* 底色先按"未连接"画成"完整 wifi + 斜杠"：开机那几秒本来就没连上，
-     * 拿到 IP 之后再换成按档位的字形，中途不会闪出一个"已连接"的样子。
-     *
-     * 未连接也走 s_wifi_glyph[3] 而不是原来的 e7e0：两者 ink 尺寸不同
-     * （22.5×17.5 vs 21×15.5），连上/断开时图标会整体涨缩一圈。 */
-    s_wifi = icon_glyph(parent, s_wifi_glyph[3], C_SUB, &ui_icon_24);
-    lv_obj_align(s_wifi, LV_ALIGN_TOP_RIGHT, -46, 2);
+    /* 自绘对象：本体只当画布用，背景/边框/内边距全部清零，尺寸就是纯坐标系。
+     * 不用 lv_obj_remove_style_all()：那样对象连"主部件样式"都没有了，
+     * invalidate 时会不会被当成完全透明、跳过 DRAW_MAIN 取决于 LVGL 版本；
+     * 显式设成透明背景更稳，代价只有三条样式设置。 */
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(o, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(o, 0, LV_PART_MAIN);
+    lv_obj_set_size(o, WIFI_ICO_W, WIFI_ICO_H);
+    lv_obj_align(o, LV_ALIGN_TOP_RIGHT, -46, 2);
+    lv_obj_add_event_cb(o, wifi_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+    s_wifi = o;
 
+    /* 斜杠：开机那几秒本来就没连上，先按"未连接"画，不会闪出一个已连接的样子。
+     * 尺寸/圆角/颜色/角度全部沿用 lan_slash() 的默认值，一个都不覆盖：
+     * 网口和 WiFi 两个图标的斜杠必须长得完全一样，否则并排放在状态栏里，
+     * 一眼就能看出"两根斜杠不是一套"。 */
     s_wifi_slash = lan_slash(parent);
-    lv_obj_align_to(s_wifi_slash, s_wifi, LV_ALIGN_CENTER, 0, 0);
-    /* 3×24 + 0x6E6E73：
-     * 斜杠必须比底图（C_SUB 0x8E8E93）深一档才看得出来 —— 之前底图是
-     * LV_OPA_50 的浅灰，斜杠用 0x9A9AA0 就够了；底图改成实色之后
-     * 同样的斜杠几乎和笔画融在一起，"划掉"就没了。
-     * 3 px 宽仍是原来的细条，只是颜色回到中间调，不抢戏也不会消失。 */
-    lv_obj_set_size(s_wifi_slash, 3, 24);
-    lv_obj_set_style_radius(s_wifi_slash, 2, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_wifi_slash, lv_color_hex(0x6E6E73), LV_PART_MAIN);
-    /* lan_slash() 建出来默认是隐藏的（给网线用），这里一开始就要划掉 */
+    lv_obj_align_to(s_wifi_slash, s_wifi, LV_ALIGN_CENTER, 0, 1);   /* 与网口同一偏移 */
+    /* lan_slash() 建出来默认隐藏（给网线用），这里一开始就要划掉 */
     lv_obj_remove_flag(s_wifi_slash, LV_OBJ_FLAG_HIDDEN);
 
     s_wifi_lvl = 0;
@@ -477,9 +553,9 @@ static void wifi_icon_update(void)
         return;
     }
 
-    bool linked   = (net_wifi_state() == NET_WIFI_CONNECTED);
+    bool   linked = (net_wifi_state() == NET_WIFI_CONNECTED);
     int8_t rssi   = net_wifi_rssi();
-    int lvl;
+    int    lvl;
 
     if (!linked) {
         lvl = 0;
@@ -496,18 +572,9 @@ static void wifi_icon_update(void)
     }
     s_wifi_lvl = lvl;
 
-    /* 换字形来表达强弱。四档 advance 相同、ink 水平居中、底边对齐，
-     * 所以 set_text 之后 label 宽度不变，右对齐位置不动。 */
-    if (lvl == 0) {
-        /* 未连接：完整 wifi + 斜杠，和已连接的档位字形同源，尺寸不跳 */
-        lv_label_set_text(s_wifi, s_wifi_glyph[3]);
-        lv_obj_set_style_text_color(s_wifi, lv_color_hex(C_SUB), LV_PART_MAIN);
-    } else {
-        lv_label_set_text(s_wifi, s_wifi_glyph[lvl - 1]);
-        /* 层数已经表达了强弱，颜色一律用正文色：再叠几档灰会让
-         * "一格"淡到像没连上。未连接才转灰，和断线网线同色。 */
-        lv_obj_set_style_text_color(s_wifi, lv_color_hex(C_TXT), LV_PART_MAIN);
-    }
+    /* 颜色由回调按 s_wifi_lvl 现算，这里只让这一小块区域重画。
+     * invalidate 之后 LVGL 会调一次 DRAW_MAIN，等于把整只图标重画一遍。 */
+    lv_obj_invalidate(s_wifi);
 
     if (linked) {
         lv_obj_add_flag(s_wifi_slash, LV_OBJ_FLAG_HIDDEN);
@@ -823,56 +890,7 @@ static lv_obj_t *app_tile(lv_obj_t *parent, int x, int y, i18n_str_t label,
     return holder;
 }
 
-/* ---------------- 桌面系统状态：CPU / 内存 / TF 卡 ---------------- */
-
-/* CPU 占用率靠 FreeRTOS 的运行时间统计算：
- * 打开 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS 后，每个任务都有累计
- * "占用 CPU 的微秒数"，占用率 = 1 - 空闲任务占比。
- *
- * 为什么不用 ulTaskGetIdleRunTimeCounter()：它只统计**调用者所在那个核**的
- * 空闲时间，双核上只能拿到一半数据。uxTaskGetSystemState 会把所有任务列出来，
- * 按名字挑出 IDLE0 / IDLE1 一起加，两个核的负载就自然合并成一个数
- * （分母是所有任务的运行时间之和，也就是两核加起来的总时间）。 */
-static TaskStatus_t s_task_st[CPU_TASK_MAX];
-static uint64_t     s_cpu_idle_last  = 0;
-static uint64_t     s_cpu_total_last = 0;
-static bool         s_cpu_base_ready = false;
-
-static int cpu_load_calc(void)
-{
-    UBaseType_t n = uxTaskGetSystemState(s_task_st, CPU_TASK_MAX, NULL);
-    if (n == 0) {
-        return -1;                 /* 数组太小或调度器还没起来 */
-    }
-
-    uint64_t idle  = 0;
-    uint64_t total = 0;
-    for (UBaseType_t i = 0; i < n; i++) {
-        total += (uint64_t)s_task_st[i].ulRunTimeCounter;
-        if (strncmp(s_task_st[i].pcTaskName, "IDLE", 4) == 0) {
-            idle += (uint64_t)s_task_st[i].ulRunTimeCounter;
-        }
-    }
-
-    if (!s_cpu_base_ready) {       /* 第一次只能建基线：差值要下一次才有 */
-        s_cpu_base_ready = true;
-        s_cpu_idle_last  = idle;
-        s_cpu_total_last = total;
-        return -1;
-    }
-
-    const uint64_t dt = total - s_cpu_total_last;
-    const uint64_t di = idle - s_cpu_idle_last;
-    s_cpu_total_last = total;
-    s_cpu_idle_last  = idle;
-
-    if (dt == 0 || di > dt) {      /* 有任务被删掉时会这样，这一次不算数 */
-        return -1;
-    }
-
-    int load = (int)(100u - (unsigned)((di * 100u) / dt));
-    return load < 0 ? 0 : (load > 100 ? 100 : load);
-}
+/* ---------------- 桌面系统状态：内存 / TF 卡 ---------------- */
 
 /* 内部 RAM 占用率。口径与信息页一致：默认堆里并了 32 MB PSRAM，
  * 按默认堆算永远是两位数以下，看不出运行时压力。 */
@@ -899,19 +917,10 @@ static void fmt_cap(char *buf, size_t n, uint64_t used_kb, uint64_t total_kb)
     }
 }
 
-/* 每 400 ms 调一次的刷新；CPU 走 1 s 节拍，文字都带死区。 */
+/* 每 400 ms 调一次的刷新，文字都带死区。 */
 static void home_stat_update(int64_t now_us)
 {
-    /* ---- CPU：1 s 采样一次，只服务信息页那一行（折线已经撤掉了） ----
-     * 采样和页面无关：离开信息页也保持连续，回到页面时数字立刻是对的。 */
-    if (now_us >= s_cpu_next_us) {
-        s_cpu_next_us = now_us + 1000000;
-
-        const int load = cpu_load_calc();
-        if (load >= 0) {
-            s_cpu_pct = load;
-        }
-    }
+    (void)now_us;
 
     if (s_cur != APP_HOME) {
         return;                     /* 看不见就不写文字，省掉重排 */
@@ -967,25 +976,35 @@ static void build_home(lv_obj_t *page)
 {
     /* 状态栏不在这里建：它是全局的（s_sb），浮在所有页之上，见 build_status_bar() */
 
-    /* ---- 左：网络 widget ---- */
+    /* ---- 左：网络 widget ----
+     * 底和右卡一样是实底白（原来是 80% 半透明，两张卡摆一起色差明显）。
+     * 下面三行的行距从 32 放到 41：原来最后一行停在 y=172，
+     * 卡高 236、小字行高 19，底下空出 45 px，比左右 24 px 内边距宽出一截，
+     * 看着像"内容没填满"。三行等距摊到 108 / 149 / 190 之后，
+     * 底边留白 236-190-19 = 27，和右卡 TF 行（同样 y=190）对齐。
+     *
+     * 标签 20→16、IP 42→55：原来标签底 38 紧贴 IP 顶 42（只隔 4 px），
+     * 而 IP 底 74 到 LINK 行 108 却空着 34 px，上下严重不对称，看着就是
+     * "标题黏在 IP 上、IP 下面挂了块空"。按行盒算，改成上 21 / 下 21
+     * （55-16-18 = 21，108-55-32 = 21），数字落在整块的视觉中心。
+     * 标签同时与右卡 DEVICES 的 y=16 对齐，两卡首行同一基线。 */
     lv_obj_t *c1 = card(page, 32, 56, 466, 236, 24);
-    lv_obj_set_style_bg_opa(c1, LV_OPA_80, LV_PART_MAIN);
     lv_obj_set_style_border_width(c1, 0, LV_PART_MAIN);
 
-    text(c1, i18n_t(H_NETWORK), UI_F_SMALL, C_SUB, 24, 20);
-    s_home_ip = text(c1, "0.0.0.0", UI_F_LARGE, C_TXT, 24, 42);
+    text(c1, i18n_t(H_NETWORK), UI_F_SMALL, C_SUB, 24, 16);
+    s_home_ip = text(c1, "0.0.0.0", UI_F_LARGE, C_TXT, 24, 55);
 
     text(c1, i18n_t(H_LINK), UI_F_SMALL, C_SUB, 24, 108);
     s_home_link = text(c1, "--", UI_F_SMALL, C_TXT, 0, 108);
     lv_obj_align(s_home_link, LV_ALIGN_TOP_RIGHT, -24, 108);
 
-    text(c1, i18n_t(H_DHCP_LEASE), UI_F_SMALL, C_SUB, 24, 140);
-    s_home_lease = text(c1, "0", UI_F_SMALL, C_TXT, 0, 140);
-    lv_obj_align(s_home_lease, LV_ALIGN_TOP_RIGHT, -24, 140);
+    text(c1, i18n_t(H_DHCP_LEASE), UI_F_SMALL, C_SUB, 24, 149);
+    s_home_lease = text(c1, "0", UI_F_SMALL, C_TXT, 0, 149);
+    lv_obj_align(s_home_lease, LV_ALIGN_TOP_RIGHT, -24, 149);
 
-    text(c1, i18n_t(H_FREE_HEAP), UI_F_SMALL, C_SUB, 24, 172);
-    s_home_heap = text(c1, "0 KB", UI_F_SMALL, C_TXT, 0, 172);
-    lv_obj_align(s_home_heap, LV_ALIGN_TOP_RIGHT, -24, 172);
+    text(c1, i18n_t(H_FREE_HEAP), UI_F_SMALL, C_SUB, 24, 190);
+    s_home_heap = text(c1, "0 KB", UI_F_SMALL, C_TXT, 0, 190);
+    lv_obj_align(s_home_heap, LV_ALIGN_TOP_RIGHT, -24, 190);
 
     /* ---- 右：设备 / 运行状态（在线台数 + 内存 + TF 卡） ----
      * 这里原来是 CPU 折线（60 点、每秒推一个点）。换成"在线设备台数"的理由：
@@ -993,8 +1012,8 @@ static void build_home(lv_obj_t *page)
      * 才是这个工具的主信息；CPU 占用率属于开发期数据，信息页里仍有百分比。
      * 顺带也去掉了每秒一次的整卡重绘（"主页一直闪"的老来源）。
      *
-     * 卡片仍然用实底而不是像左边那样 80% 半透明：半透明意味着每次重绘
-     * 都要把下面的渐变壁纸重新合成一遍。 */
+     * 卡片是实底白，不做半透明：半透明意味着每次重绘都要把下面的渐变壁纸
+     * 重新合成一遍，而且两张卡摆一起能有肉眼可见的色差。 */
     lv_obj_t *c2 = card(page, 526, 56, 466, 236, 24);
     lv_obj_set_style_border_width(c2, 0, LV_PART_MAIN);
 
@@ -1049,7 +1068,7 @@ static void build_home(lv_obj_t *page)
 
     /* ---- 图标网格：4 个居中排布，4*96 + 3*32 = 480，(1024-480)/2 = 272 ---- */
     app_tile(page, 272, 322, A_DEVICES,  0xEAF3FF, 0xD4E6FF, 0x1A63C8, ICO_DEVICES,  APP_DEVICES);
-    app_tile(page, 400, 322, A_UPGRADE,  0xE8F9EF, 0xD0F1DD, 0x127A3E, ICO_UPLOAD,   APP_UPGRADE);
+    app_tile(page, 400, 322, A_UPGRADE,  0xE8F9EF, 0xD0F1DD, 0x127A3E, ICO_UPGRADE, APP_UPGRADE);
     app_tile(page, 528, 322, A_INFO,     0xF3ECFF, 0xE3D4FF, 0x6B34C0, ICO_INFO,     APP_INFO);
     app_tile(page, 656, 322, A_SETTINGS, 0xF2F2F7, 0xE4E4EC, 0x4A4C5A, ICO_SETTINGS, APP_SETTINGS);
 
@@ -1507,48 +1526,80 @@ static lv_obj_t *info_row(lv_obj_t *parent, const char *k, int y)
     return v;
 }
 
+/* 卡片小标题：比行标签大一号、用主文字色，下面压一条 1 px 分隔线。
+ * 原来标题和行标签都是 UI_F_SMALL + C_SUB，两行字在视觉上完全同级，
+ * 一眼看不出"这张卡从哪开始"。 */
+static void info_title(lv_obj_t *card, const char *t)
+{
+    text(card, t, UI_F_BASE, C_TXT, 24, 14);
+
+    lv_obj_t *sep = plain(card);
+    lv_obj_set_pos(sep, 24, 50);
+    lv_obj_set_size(sep, 484 - 48, 1);
+    lv_obj_set_style_bg_color(sep, lv_color_hex(C_LINE), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, LV_PART_MAIN);
+}
+
 static void build_info(lv_obj_t *page)
 {
-    lv_obj_t *a = card(page, 20, CONTENT_Y, 484, 460, 20);
-    text(a, i18n_t(I_NETWORK), UI_F_SMALL, C_SUB, 24, 20);
-    s_in_ip    = info_row(a, i18n_t(I_ADDRESS), 56);
-    s_in_mask  = info_row(a, i18n_t(I_NETMASK), 100);
-    s_in_gw    = info_row(a, i18n_t(I_GATEWAY), 144);
-    s_in_link  = info_row(a, i18n_t(I_LINK), 188);
-    s_in_lease = info_row(a, i18n_t(I_LEASE), 232);
+    /* 两张卡等高 340：内容（5 / 4 行）铺满即可，原来 460 高只是为了塞下
+     * 已经删掉的设备数 / 升级状态 / CPU 三行，留着底下一大片空白反而难看。 */
+    lv_obj_t *a = card(page, 20, CONTENT_Y, 484, 340, 20);
+    info_title(a, i18n_t(I_NETWORK));
+    s_in_ip    = info_row(a, i18n_t(I_ADDRESS), 66);
+    s_in_mask  = info_row(a, i18n_t(I_NETMASK), 120);
+    s_in_gw    = info_row(a, i18n_t(I_GATEWAY), 174);
+    s_in_link  = info_row(a, i18n_t(I_LINK), 228);
+    s_in_lease = info_row(a, i18n_t(I_LEASE), 282);
 
-    lv_obj_t *b = card(page, 520, CONTENT_Y, 484, 460, 20);
-    text(b, i18n_t(I_SYSTEM), UI_F_SMALL, C_SUB, 24, 20);
+    lv_obj_t *b = card(page, 520, CONTENT_Y, 484, 340, 20);
+    info_title(b, i18n_t(I_SYSTEM));
 
-    /* 内存：一条进度条 + 右上角大号百分比。
-     * 只取内部 RAM（MALLOC_CAP_INTERNAL）：默认堆里还并入了 32 MB PSRAM，
-     * 按默认堆算占用率会被稀释到个位数，看不出运行时的真实压力。
-     * PSRAM 单独一行显示容量，够判断大块分配有没有吃满。 */
-    text(b, i18n_t(I_RAM), UI_F_SMALL, C_SUB, 24, 56);
+    /* 内存：一条三段条 + 右上角大号百分比。
+     * 只看内部 RAM（MALLOC_CAP_INTERNAL）：默认堆里并入了 32 MB PSRAM，
+     * 按默认堆算占用率会被稀释到个位数，看不出运行时的真实压力。 */
+    text(b, i18n_t(I_RAM), UI_F_SMALL, C_SUB, 24, 68);
 
-    s_in_mem_pct = text(b, "0%", UI_F_LARGE, C_TXT, 0, 42);
-    lv_obj_align(s_in_mem_pct, LV_ALIGN_TOP_RIGHT, -24, 42);
+    s_in_mem_pct = text(b, "0%", UI_F_LARGE, C_TXT, 0, 54);
+    lv_obj_align(s_in_mem_pct, LV_ALIGN_TOP_RIGHT, -24, 54);
 
-    s_in_mem_bar = lv_bar_create(b);
-    lv_obj_remove_flag(s_in_mem_bar, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_pos(s_in_mem_bar, 24, 96);
-    lv_obj_set_size(s_in_mem_bar, 436, 12);
-    lv_bar_set_range(s_in_mem_bar, 0, 100);
-    lv_bar_set_value(s_in_mem_bar, 0, LV_ANIM_OFF);
-    lv_obj_set_style_radius(s_in_mem_bar, 6, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_in_mem_bar, lv_color_hex(0xE9E9EE), LV_PART_MAIN);
-    lv_obj_set_style_radius(s_in_mem_bar, 6, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_in_mem_bar, lv_color_hex(C_BLUE), LV_PART_INDICATOR);
+    /* 条不用 lv_bar：bar 只有一个 indicator，没法把"系统预留"和"堆已用"
+     * 分两种颜色。这里自己拼三段，坐标由 refresh 按实际 KB 数算宽度：
+     *   [0, res)          灰   系统/静态预留（开机即固定，768 - 堆总量）
+     *   [res, used)       彩色 堆已用（蓝 / 橙 / 红）
+     *   [used, 768)       浅灰 堆空闲
+     * 彩色段左移 6 px 盖住灰段的圆角，接缝才不会有豁口。 */
+    lv_obj_t *trk = plain(b);
+    lv_obj_set_pos(trk, 24, 96);
+    lv_obj_set_size(trk, UI_MEM_BAR_W, 12);
+    lv_obj_set_style_radius(trk, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(trk, lv_color_hex(0xE9E9EE), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(trk, LV_OPA_COVER, LV_PART_MAIN);
 
-    s_in_mem_sub = text(b, "-", UI_F_SMALL, C_SUB, 24, 116);
+    s_in_mem_res = plain(b);
+    lv_obj_set_pos(s_in_mem_res, 24, 96);
+    lv_obj_set_size(s_in_mem_res, 0, 12);
+    lv_obj_set_style_radius(s_in_mem_res, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_in_mem_res, lv_color_hex(0xB4B4BF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_in_mem_res, LV_OPA_COVER, LV_PART_MAIN);
 
-    s_in_psram = info_row(b, i18n_t(I_PSRAM), 160);
+    s_in_mem_used = plain(b);
+    lv_obj_set_pos(s_in_mem_used, 24, 96);
+    lv_obj_set_size(s_in_mem_used, 0, 12);
+    lv_obj_set_style_radius(s_in_mem_used, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_in_mem_used, lv_color_hex(C_BLUE), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_in_mem_used, LV_OPA_COVER, LV_PART_MAIN);
+
+    /* 小字就是这条的图例：三段各写一个 KB 数，并用 recolor 染成和条上
+     * 一一对应的颜色（已用=条色 / 系统=灰 / 空闲=浅灰），不用再去猜
+     * "这根蓝的到底算不算系统"。'#' 只作标记，不进渲染。 */
+    s_in_mem_sub = text(b, "", UI_F_SMALL, C_SUB, 24, 118);
+    lv_label_set_recolor(s_in_mem_sub, true);
+
+    s_in_psram = info_row(b, i18n_t(I_PSRAM), 152);
     s_in_flash = info_row(b, i18n_t(I_FLASH), 200);
-    s_in_min   = info_row(b, i18n_t(I_MIN_HEAP), 240);
-    s_in_up    = info_row(b, i18n_t(I_UPTIME), 280);
-    s_in_dev   = info_row(b, i18n_t(I_DEVICES), 320);
-    s_in_ota   = info_row(b, i18n_t(I_OTA_STATE), 360);
-    s_in_cpu   = info_row(b, i18n_t(H_CPU), 400);   /* 桌面折线撤掉后，CPU 只在这里看 */
+    s_in_min   = info_row(b, i18n_t(I_MIN_HEAP), 248);
+    s_in_up    = info_row(b, i18n_t(I_UPTIME), 296);
 }
 
 /* ---------------- 设置页 ---------------- */
@@ -1891,10 +1942,11 @@ static void wifi_detail_state(char *buf, size_t n)
     case NET_WIFI_CONNECTED: {
         /* 分隔符必须按语言切：
          *   中文走 ui_font_zh_16，字库里补了 U+00B7（见 gen_fonts.py 的
-         *   EXTRA_SYMBOLS），中点正常；
-         *   英文走 lv_font_montserrat_14，那套只有 ASCII，U+00B7 会被渲染成
-         *   方块（用户反馈"英文界面下那个也是方块"）。
-         * 不去给 montserrat 加 fallback：两套字库行高与字宽不同，
+         *   --range 0xB7），中点正常；
+         *   英文走 ui_font_en_14（SF Pro Display 的 ASCII 子集），只有
+         *   0x20-0x7E，U+00B7 会被渲染成方块（用户反馈"英文界面下那个
+         *   也是方块"）。原来用 Montserrat 时同理。
+         * 不去给英文字库加 fallback：两套字库行高与字宽不同，
          * 混排会让整行基线抖动，代价远大于换个分隔符。 */
         const char *sep = (i18n_lang() == LANG_ZH) ? " · " : "  |  ";
 
@@ -2806,7 +2858,6 @@ static void refresh_cb(lv_timer_t *t)
     ota_status_t st;
     ota_client_get_status(&st);
 
-    int devn = dev_table_count();
     unsigned pct = 0;
     if (st.total > 0) {
         pct = (unsigned)(((uint64_t)st.acked * 100u) / st.total);
@@ -3060,35 +3111,80 @@ static void refresh_cb(lv_timer_t *t)
 
         set_txt_fmt(s_in_lease, "%u", (unsigned)net_dhcps_lease_count());
 
-        /* ---- 内存：内部 RAM 占用率（进度条 + 百分比） ----
-         * 取 MALLOC_CAP_INTERNAL：默认堆里还并入了 32 MB PSRAM
-         * （CONFIG_SPIRAM_USE_MALLOC=y），按默认堆算占用率永远只有个位数，
-         * 看不出运行时压力。真正会耗尽的正是内部 RAM。 */
-        size_t ram_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        size_t ram_free  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        unsigned ram_pct = ram_total ? (unsigned)(((ram_total - ram_free) * 100u) / ram_total) : 0u;
+        /* ---- 内存：按硬件 768 KB 画全长 ----
+         * heap_caps 只统计到 462 KB 左右，差额是静态段 + 启动预留。那段内存
+         * 应用拿不到，但确实被占着，所以条上单独涂灰；不把它从总数里悄悄
+         * 减掉 —— 否则"共 462 KB"会让人以为这颗芯片只有这么多 RAM。
+         * 百分比同样按 768 算，和条保持一致。 */
+        const size_t ram_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        const size_t ram_free  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
-        /* 只在百分比整数变化时重画：内部 RAM 的 1% ≈ 4 KB，
-         * 比桌面那个 8 KB 死区还稳，稳态下进度条完全不重绘。 */
+        const unsigned hw_kb   = UI_RAM_HW_KB;
+        const unsigned heap_kb = (unsigned)(ram_total / 1024u);
+        const unsigned free_kb = (unsigned)(ram_free / 1024u);
+        const unsigned rsvd_kb = hw_kb > heap_kb ? hw_kb - heap_kb : 0u;
+        const unsigned used_kb = hw_kb > free_kb ? hw_kb - free_kb : hw_kb;  /* 含预留 */
+        const unsigned hw_safe = hw_kb > 0u ? hw_kb : 1u;
+        const unsigned ram_pct = (unsigned)(((uint64_t)used_kb * 100u + hw_safe / 2u) / hw_safe);
+
+        /* 只在百分比整数变化时重画：1% ≈ 7.7 KB，稳态下三段条完全不重绘 */
         if ((int)ram_pct != s_in_mem_shown) {
             s_in_mem_shown = (int)ram_pct;
 
+            const int32_t rpx = (int32_t)((uint32_t)UI_MEM_BAR_W * rsvd_kb / hw_safe);
+            const int32_t upx = (int32_t)((uint32_t)UI_MEM_BAR_W * used_kb / hw_safe);
+            const int32_t uw  = upx - rpx + 6;    /* 左移 6 px 盖住灰段的圆角 */
+
+            lv_obj_set_width(s_in_mem_res, rpx);
+            lv_obj_set_pos(s_in_mem_used, 24 + rpx - 6, 96);
+            lv_obj_set_width(s_in_mem_used, uw > 0 ? uw : 6);
+
             set_txt_fmt(s_in_mem_pct, "%u%%", ram_pct);
-            lv_bar_set_value(s_in_mem_bar, (int32_t)ram_pct, LV_ANIM_OFF);
-            /* 蓝 → 橙 → 红：还能跑 / 该留意 / 快没了 */
-            lv_obj_set_style_bg_color(s_in_mem_bar,
-                                      lv_color_hex(ram_pct >= 85u ? C_RED
-                                                   : ram_pct >= 70u ? C_ORANGE : C_BLUE),
-                                      LV_PART_INDICATOR);
-            set_txt_fmt(s_in_mem_sub, i18n_t(I_RAM_DETAIL),
-                        (unsigned)(ram_free / 1024), (unsigned)(ram_total / 1024));
+            /* 蓝 → 橙 → 红。门槛按 768 口径重设：开机就背着 306 KB 预留，
+             * 沿用旧的 85/70 会一上电就亮橙色。88% ≈ 堆用掉 91%，94% ≈ 98%。 */
+            const unsigned used_rgb = ram_pct >= 94u ? C_RED
+                                    : ram_pct >= 88u ? C_ORANGE : C_BLUE;
+            lv_obj_set_style_bg_color(s_in_mem_used, lv_color_hex(used_rgb), LV_PART_MAIN);
+
+            /* 图例就是这行字本身：三个 KB 数各染成条上对应那段的颜色，
+             * 再加一个总数，"颜色代表什么"不用再猜。
+             * 英文串全 ASCII（Montserrat 没有 ·，之前那两个点会变方框）。 */
+            char seg_u[32], seg_s[32], seg_f[32], seg_t[32], line[192];
+            snprintf(seg_u, sizeof seg_u, i18n_t(I_RAM_USED_FMT), heap_kb - free_kb);
+            snprintf(seg_s, sizeof seg_s, i18n_t(I_RAM_SYS_FMT),  rsvd_kb);
+            snprintf(seg_f, sizeof seg_f, i18n_t(I_RAM_FREE_FMT), free_kb);
+            snprintf(seg_t, sizeof seg_t, i18n_t(I_RAM_TOTAL_FMT), hw_kb);
+
+            /* 拼串的缓冲要留足：4 组 "#RRGGBB 文字#" 固定 43 字节，编译器按
+             * 每段最多 31 字节算，192 才够它确认不会截断（-Wformat-truncation
+             * 会按缓冲区上限而不是实际内容长度推最坏情况）。
+             * 系统段文字用 9A9AA4 而不是条上那个 B4B4BF：同样是大块面积才
+             * 显浓的浅灰，14/16 px 的字按 B4B4BF 上白底几乎看不清。
+             *
+             * ⚠ recolor 的语法是 "#RRGGBB<空格>文字#"，颜色参数后面**必须是空格**，
+             * 写成 "#RRGGBB#文字#" 会整段错乱。lv_draw_label.c 的状态机是：
+             *   '#' 之后进入 PARAMETER，非空格字符一律 continue（吞掉），
+             *   只有遇到空格且 "#" 到空格恰好 7 个字符时才算颜色解析成功、
+             *   进入 TEXT_INPUT 开始染色，并把这个分隔空格跳过不画。
+             * 如果第 7 个字符是 '#'：PARAMETER 分支只把状态退回 WAIT_FOR_PARAMETER
+             * 而**不 continue**，于是那个 '#' 被当普通字符画出来；紧接着的文字用
+             * 默认色绘制；下一段开头的 "#9A9AA4" 又因为没有 TEXT_INPUT 的收尾 '#'
+             * 被当正文，屏上就出现 "#已占用 233 KB 9A9AA4…" 这种东西。 */
+            snprintf(line, sizeof line,
+                     "#%06X %s#  #9A9AA4 %s#  #8E8E93 %s#  #8E8E93 %s#",
+                     used_rgb, seg_u, seg_s, seg_f, seg_t);
+            set_txt(s_in_mem_sub, line);
         }
 
-        /* PSRAM 单独一行：总量不变，free 变化用 MB 取整，实际很少重绘 */
+        /* PSRAM 单独一行：和上面 INTERNAL RAM 统一成"已用"口径，两处数字
+         * 才是同一个方向，不会一处读已用、另一处读空闲。
+         * 32 MB 里实际只占着 1024×600 RGB565 单帧缓冲约 1.2 MB，所以是
+         * "已用 1 MB / 共 32 MB"，看着空得多是正常的。 */
         size_t ps_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
         size_t ps_free  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        set_txt_fmt(s_in_psram, "%u / %u MB",
-                    (unsigned)((ps_free + 512u * 1024u) / (1024u * 1024u)),
+        const size_t ps_used = ps_total > ps_free ? ps_total - ps_free : 0u;
+        set_txt_fmt(s_in_psram, i18n_t(I_PSRAM_FMT),
+                    (unsigned)((ps_used + 512u * 1024u) / (1024u * 1024u)),
                     (unsigned)((ps_total + 512u * 1024u) / (1024u * 1024u)));
 
         /* Flash 容量：问驱动要（读 JEDEC ID / SFDP 实测），
@@ -3128,14 +3224,9 @@ static void refresh_cb(lv_timer_t *t)
                         up_s / 86400u, (up_s % 86400u) / 3600u);
         }
 
-        set_txt_fmt(s_in_dev, "%d", devn);
-        set_txt_fmt(s_in_ota, "%s %u%%", state_txt(st.state), pct);
-
-        /* CPU：整数变了才写（1 s 采样一次，稳态下几乎不重绘） */
-        if (s_cpu_pct >= 0 && s_cpu_pct != s_in_cpu_shown) {
-            s_in_cpu_shown = s_cpu_pct;
-            set_txt_fmt(s_in_cpu, "%d%%", s_cpu_pct);
-        }
+        /* 设备数 / 升级状态 / CPU 三行已删：这一页是给现场排障用的，
+         * 设备数量在桌面和升级页都看得到，升级进度在升级页更准，
+         * CPU 占用率属于开发期数据，日常没人看。 */
     }
 }
 
@@ -3261,7 +3352,6 @@ static void ui_app_rebuild(void)
     s_upg_have_sig   = false;
     s_heap_shown     = -1;
     s_in_mem_shown   = -1;
-    s_in_cpu_shown   = -1;
     s_flash_shown    = -1;
     s_arc_shown      = -1;
     s_busy_shown     = -1;

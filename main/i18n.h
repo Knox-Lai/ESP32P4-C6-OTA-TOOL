@@ -98,9 +98,17 @@ typedef enum {
     I_LINK,
     I_LEASE,
     I_SYSTEM,
-    I_RAM,                /* 内部 RAM 占用（配进度条） */
-    I_RAM_DETAIL,         /* "free %u KB / %u KB" */
+    I_RAM,                /* 内部 RAM（配 768 KB 三段条） */
+    /* 内部 RAM 条下方的分段说明：一段一个数，颜色由 ui_app 用 recolor 上，
+     * 和条上三段一一对应，等于把图例直接写在数上。
+     * 英文一律走 ASCII —— 英文字库是 SF Pro Text 的 0x20-0x7E 子集，
+     * 没有 U+00B7（·），之前 "free %u · sys %u" 里那两个点会画成方框。 */
+    I_RAM_USED_FMT,       /* "已用 %u"：堆已用，条上彩色段 */
+    I_RAM_SYS_FMT,        /* "系统 %u"：静态段 + 启动预留，条上灰段 */
+    I_RAM_FREE_FMT,       /* "空闲 %u"：堆空闲，条上留白 */
+    I_RAM_TOTAL_FMT,      /* "共 %u KB" */
     I_PSRAM,
+    I_PSRAM_FMT,          /* "已用 %u MB / 共 %u MB"：与 INTERNAL RAM 同为已用口径 */
     I_FLASH,              /* 本机 SPI Flash 容量 */
     I_MIN_HEAP,
     I_UPTIME,
@@ -188,10 +196,17 @@ typedef enum {
 
 /* ---------------- 字体 ---------------- */
 
-/* 生成的中文字库（tools/fontgen/gen_fonts.py 产出，HarmonyOS Sans SC Medium 子集） */
+/* 生成的中文字库（tools/fontgen/gen_fonts.py 产出，PingFang SC Regular 子集） */
 extern const lv_font_t ui_font_zh_16;
 extern const lv_font_t ui_font_zh_22;
 extern const lv_font_t ui_font_zh_30;
+
+/* 生成的英文字库（同上脚本产出，SF Pro Text Regular 的 ASCII 子集）。
+ * 只含 0x20-0x7E，没有 ° • · 之类，也没有 LV_SYMBOL_* —— 英文文案已经
+ * 清成纯 ASCII，图标全部走 ui_icon_*，这两类字形不需要。 */
+extern const lv_font_t ui_font_en_14;
+extern const lv_font_t ui_font_en_20;
+extern const lv_font_t ui_font_en_28;
 
 /* iconfont 子集：桌面 App 图标（40 px，字形已做视觉归一化）
  * 与状态栏/列表小图标（24 px） */
@@ -200,8 +215,8 @@ extern const lv_font_t ui_icon_24;
 
 /**
  * 三档界面字号。中文和英文各取适合自己字面的号数：
- *   英文 Montserrat   14 / 20 / 28
- *   中文 HarmonyOS    16 / 22 / 30
+ *   英文 SF Pro Text      14 / 20 / 28
+ *   中文 PingFang SC Regular 16 / 22 / 30
  * 汉字的字面比拉丁小、笔画密，和拉丁用同一个 px 会显小，所以中文抬 2 px。
  */
 typedef enum {
@@ -218,13 +233,14 @@ typedef enum {
 #define ICO_LINK        "\xEE\x98\xB1"   /* e631 网络接口（以太网口） */
 #define ICO_DISCONNECT  "\xEE\x9F\xA1"   /* e7e1 disconnect  */
 #define ICO_DEVICES     "\xEE\xAE\xB7"   /* ebb7 设备管理     */
-#define ICO_UPLOAD      "\xEE\x9F\x99"   /* e7d9 cloud-upload */
+#define ICO_UPLOAD      "\xEE\x9F\x99"   /* e7d9 cloud-upload（底部浮条的工具图标） */
+#define ICO_UPGRADE     "\xEE\x9C\xA7"   /* e727 云端同步（云 + 向下箭头，桌面升级 App） */
 #define ICO_INFO        "\xEE\x9A\x9E"   /* e69e information */
 #define ICO_SETTINGS    "\xEE\xAE\x8D"   /* eb8d 设置        */
 #define ICO_LANG        "\xEE\x99\x94"   /* e654 多语言（设置里的"语言"行） */
 #define ICO_LANG_EN     "\xEE\xAF\xA0"   /* ebe0 英文        */
 #define ICO_LANG_ZH     "\xEE\xAF\xA2"   /* ebe2 中文        */
-#define ICO_BRIGHT      "\xEE\x9A\x98"   /* e698 brightness（亮度行 / 亮度子页的太阳） */
+#define ICO_BRIGHT      "\xEE\x9A\x9B"   /* e69b brightness1（太阳左半填充，24 px 下比空心的 e698 更有分量） */
 #define ICO_WIFI        "\xEE\x9F\xA0"   /* e7e0 wifi（状态栏 / 设置里的 WiFi 行） */
 
 /* e6a1-e6a4：状态栏用的 4 档信号强度字形，由设计稿的 4 个 SVG

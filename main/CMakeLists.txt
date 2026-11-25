@@ -21,11 +21,16 @@ idf_component_register(
          "sys_clock.c"
          "ui_app.c"
          # 生成的字库（tools/fontgen/gen_fonts.py 产出）：
-         #   HarmonyOS Sans SC Medium 子集（16/22/30 px）+ iconfont 子集。
-         # 改了 i18n.c 里的中文文案后必须重跑脚本，否则新字会直接显示成方块。
+         #   PingFang SC Regular 子集（16/22/30 px，中文）
+         #   SF Pro Text Regular 的 ASCII 子集（14/20/28 px，英文）
+         #   iconfont 子集
+         # 改了 i18n.c 里的文案后必须重跑脚本，否则新字会直接显示成方块。
          "fonts/ui_font_zh_16.c"
          "fonts/ui_font_zh_22.c"
          "fonts/ui_font_zh_30.c"
+         "fonts/ui_font_en_14.c"
+         "fonts/ui_font_en_20.c"
+         "fonts/ui_font_en_28.c"
          "fonts/ui_icon_40.c"
          "fonts/ui_icon_24.c"
     INCLUDE_DIRS "."

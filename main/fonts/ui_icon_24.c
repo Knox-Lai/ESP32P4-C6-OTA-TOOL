@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 24 px
  * Bpp: 4
- * Opts: --bpp 4 --size 24 --format lvgl --lv-include lvgl.h --no-compress --lv-font-name ui_icon_24 -o C:\Users\EL\Desktop\ESP32P4\ESP32P4-colorscaping\firmware\main\fonts\ui_icon_24.c --font C:\Users\EL\Desktop\ESP32P4\ESP32P4-colorscaping\tools\fontgen\iconfont_clean.ttf --range 0xE600-0xEC2F
+ * Opts: --bpp 4 --size 24 --format lvgl --lv-include lvgl.h --no-compress --lv-font-name ui_icon_24 -o E:\ESP32P4\ESP32P4-colorscaping\firmware\main\fonts\ui_icon_24.c --font E:\ESP32P4\ESP32P4-colorscaping\tools\fontgen\iconfont_clean.ttf --range 0xE600-0xEC2F
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE

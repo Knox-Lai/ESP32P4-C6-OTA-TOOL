@@ -45,7 +45,7 @@ PC 侧配套：`../tools/ota_sim.py`（设备模拟器：UDP 4010 发现 + TCP 4
 推荐直接用工程自带脚本（自动激活环境、只在目标不对时才 set-target）：
 
 ```powershell
-cd C:\Users\EL\Desktop\ESP32P4\ESP32P4-colorscaping\firmware
+cd E:\ESP32P4\ESP32P4-colorscaping\firmware
 .\build.bat                 # 只编译（务必用 .bat，见下）
 .\build.bat -Flash          # 编译 + 烧写 + 串口监视 (COM69)
 .\build.bat -Flash -Port COM12
@@ -59,7 +59,7 @@ cd C:\Users\EL\Desktop\ESP32P4\ESP32P4-colorscaping\firmware
 
 ```powershell
 . "C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1"   # 注意前面的点，必须 dot-source
-cd C:\Users\EL\Desktop\ESP32P4\ESP32P4-colorscaping\firmware
+cd E:\ESP32P4\ESP32P4-colorscaping\firmware
 idf.py set-target esp32p4   # 已有正确 sdkconfig 时可跳过；会清空 sdkconfig 与 build
 idf.py build
 idf.py -p COM69 flash monitor

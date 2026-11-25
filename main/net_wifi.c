@@ -70,6 +70,14 @@ static const char *TAG = "wifi";
  * 停下来把原因钉在界面上，等人来处理更诚实。
  * 计数在每次用户动作（点选网络 / 拨开关）或成功拿到 IP 时清零。 */
 #define RETRY_MAX_TIMES 3
+/* 放弃重连之后，失败原因在屏幕上还留多久。
+ *
+ * 停在 FAILED 不动的老做法有两个毛病：设置页那一行永远是"密码错误"，
+ * 看着像卡死；用户真正要做的事（换个网络 / 重输密码）还得先手动按"断开"。
+ * 留 10 s 足够看清一行原因，之后自动收回 IDLE：界面回到"未连接"这个
+ * 可操作的空态，同时把 s_want 清掉，免得回到 IDLE 又被"扫后补连"接回去。
+ * 太短（3 s）来不及读，太长又像卡住。 */
+#define FAIL_HOLD_MS    6000
 /* 连接尝试的超时：正常 WPA2 关联 1~3 s。hosted 环境下偶尔收不到
  * WIFI_EVENT_STA_DISCONNECTED，状态会永远停在 CONNECTING，
  * 而重连逻辑只在 FAILED 触发 —— 没有这个超时，一次卡死就再也不连了。 */
@@ -129,6 +137,17 @@ static volatile int    s_retry = 0;
 /* 本次连上的网络要不要写进"已知网络"表（见 net_wifi_connect 的注释）。
  * 用"事后落表"而不是"事前落表"：只有真的连上过，才算已知网络。 */
 static volatile bool   s_save_ok = false;
+/* 当前 s_ssid/s_pass 是否"验证过"（真的连上过一次）。
+ *
+ * 这两个字段身兼两职：既是"这一次要连的目标"，也是"下次开机自动连的目标"，
+ * 而 cfg_save() 只会照抄它们。于是"一次输错密码的尝试 + 任意一次 cfg_save"
+ * 就把 NVS 里的开机目标改成了那个连不上的网络 —— net_wifi_set_enabled()
+ * 里就有一句无条件 cfg_save（拨一下 WiFi 开关即触发）。现场表现正是
+ * "开机总是先对着上次输错密码的那个 SSID 试一轮"。
+ *
+ * 现在只有验证过的目标才允许写 KEY_SSID/KEY_PASS（见 cfg_save）：
+ * 未验证的尝试只活在内存里，NVS 里那份上一个能用的目标原样保留。 */
+static volatile bool   s_target_ok = false;
 /* 本轮重连预算已用尽（见 RETRY_MAX_TIMES）。
  * 为真时守护循环不再自动重连，状态停在 FAILED 等用户动作；
  * 界面靠 net_wifi_retry_pending() 区分"还在重试"和"已放弃"，
@@ -146,11 +165,20 @@ static bool s_sv_dirty = false;     /* 表变过才写 NVS，避免每次开机�
 static esp_netif_t   *s_netif = NULL;
 static net_wifi_cb_t  s_cb    = NULL;
 
-/* 扫描结果：只有 wifi 任务和 UI 读，写入发生在事件回调里，
- * 用 s_scan_seq 做"发布"栅栏 —— UI 先读 seq 再读数组，读到奇数代次就跳过。 */
+/* 扫描结果：写入在事件回调（WIFI_EVENT_SCAN_DONE）里，读在 UI 线程。
+ * 两边都是整型赋值/整块 memcpy，条目最多 SCAN_MAX 条，不加锁也不会读到半条记录；
+ * 唯一要防的是"写到一半被读"，发布顺序固定为"先填 s_aps 再写 s_ap_n"，
+ * 读方先拿 s_ap_n 再 memcpy，最多读到上一代完整结果，不会越界。 */
 static net_wifi_ap_t s_aps[SCAN_MAX];
 static volatile int  s_ap_n     = 0;
 static volatile bool s_scanning = false;
+/* 本轮扫描的 SCAN_DONE 是否已经处理过。
+ * hosted 环境下同一轮扫描偶尔会上报两次 WIFI_EVENT_SCAN_DONE（实测相隔 12 ms），
+ * 而 esp_wifi_scan_get_ap_records() 是"取走即清空"：第一次取走 11 条并发布，
+ * 第二次取到 0 条又把 s_ap_n 写成 0 —— 界面上就是"日志说扫到 11 个，
+ * 屏幕上一个都不显示"。所以一轮扫描只认第一个 SCAN_DONE，重复的直接丢掉。
+ * 每次真正发起扫描（net_wifi_scan_start）都要清回 false。 */
+static volatile bool s_scan_done_seen = false;
 /* 驱动还没起来时收到的扫描请求（典型场景：用户刚把开关拨开就想看列表）。
  * esp_wifi_scan_start() 在 s_driver_up=false 时一定失败，直接返回错误的话
  * 界面上什么都不会发生 —— 所以先挂起，等 STA_START 之后由 wifi 任务补扫。 */
@@ -174,7 +202,9 @@ static volatile bool s_conn_pending = false;
  * 改为保持 CONNECTING 并立即重连一次。 */
 static volatile int64_t s_grace_until = 0;
 /* 窗口内已经"立即重连"过几次。只给 1 次：第二次还断就说明真的有问题，
- * 该老老实实显示失败（比如密码错，第二次也会 reason=15）。 */
+ * 该老老实实显示失败（比如密码错，第二次也会 reason=15）。
+ * **只在 apply_cfg() 里清零**，push_cfg_and_connect() 不清 —— 后者每次自动
+ * 重连都会调，清了就等于把这个闸门永久打开（见 push_cfg_and_connect 的注释）。 */
 static volatile int     s_soft_retry  = 0;
 /* 事件回调不碰协议栈（hosted 下 RPC 可能阻塞事件任务），
  * 只置这个标志，由 wifi 任务在 1 s 内发起重连。 */
@@ -416,7 +446,10 @@ static void cfg_load(void)
 
     size_t len = sizeof(s_ssid);
     if (nvs_get_str(h, KEY_SSID, s_ssid, &len) == ESP_OK && s_ssid[0] != '\0') {
-        s_have_cfg = true;
+        s_have_cfg  = true;
+        /* NVS 里这份只可能是"连成功过"时写下去的（见 cfg_save），
+         * 所以直接算验证过，开机允许拿它当默认目标。 */
+        s_target_ok = true;
         len = sizeof(s_pass);
         if (nvs_get_str(h, KEY_PASS, s_pass, &len) != ESP_OK) {
             s_pass[0] = '\0';
@@ -449,13 +482,16 @@ static void cfg_save(void)
 
     nvs_set_u8(h, KEY_VER, CFG_VER);
     nvs_set_u8(h, KEY_EN, s_enabled ? 1 : 0);
-    if (s_have_cfg) {
+    if (s_have_cfg && s_target_ok) {
         nvs_set_str(h, KEY_SSID, s_ssid);
         nvs_set_str(h, KEY_PASS, s_pass);
-    } else {
+    } else if (!s_have_cfg) {
         nvs_erase_key(h, KEY_SSID);
         nvs_erase_key(h, KEY_PASS);
     }
+    /* 剩下的情况是 s_have_cfg && !s_target_ok：内存里是一次还没验证的尝试
+     * （密码可能错），NVS 里那份可能还是上一个能用的目标。两个键都不动 ——
+     * 覆盖会把开机目标改坏，删掉则连"退回上一个能用的网络"都没了。 */
     saved_save(h);
     nvs_commit(h);
     nvs_close(h);
@@ -470,8 +506,12 @@ static void scan_collect(void)
 
     esp_err_t err = esp_wifi_scan_get_ap_records(&n, recs);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "取扫描结果失败：%s", esp_err_to_name(err));
-        n = 0;
+        /* 取失败（hosted 下 RPC 超时就会走到这里）保留上一次的列表：
+         * 清空等于"用户刚看到 11 个网络，下一轮扫描全没了"，
+         * 比留一份稍旧的列表糟糕得多。 */
+        ESP_LOGW(TAG, "取扫描结果失败：%s（保留上次列表 %d 个）",
+                 esp_err_to_name(err), s_ap_n);
+        return;
     }
 
     /* 同名 SSID（mesh / 多 AP）只留最强的一条，否则列表里一堆重复项 */
@@ -577,7 +617,12 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     switch (id) {
     case WIFI_EVENT_STA_START:
         s_driver_up = true;
-        set_state(s_want ? NET_WIFI_CONNECTING : NET_WIFI_IDLE);
+        /* 有挂起的扫描（开机 / 拨开关的"先扫再连"）或已经在扫时先停在 IDLE：
+         * 置成 CONNECTING 会让守护循环把扫描一直推迟到连接超时（20 s），
+         * 表现就是"开机一直转圈、列表空白"；扫完的补连又只认 IDLE，
+         * 一旦错过就白等到 20 s 超时。 */
+        set_state((s_want && !s_scan_wanted && !s_scanning)
+                  ? NET_WIFI_CONNECTING : NET_WIFI_IDLE);
         break;
 
     case WIFI_EVENT_STA_DISCONNECTED: {
@@ -623,7 +668,11 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
          *
          * 处理方式：状态保持 CONNECTING，置 s_imm_retry 让任务下一拍立刻重连，
          * 不走 2 s→30 s 的退避；窗口内的"立即重连"只给 1 次，第二次还断
-         * （例如密码错的 15）就照旧判 FAILED，错误反馈不受影响。 */
+         * （例如密码错的 15）就照旧判 FAILED，错误反馈不受影响。
+         *
+         * **密码类（4/15/202/204）不进这条豁免**：切网/重配制造出来的尾巴
+         * 只有 3/8，15 出现就是握手真的没过，再给一次立即重连只会让
+         * "密码错"多转 6 s 才报错（现场日志：每 3.5 s 一条"立即重连"）。 */
         int64_t now_ms = esp_timer_get_time() / 1000;
         bool leaving   = (r == 3 || r == 8);
         bool in_grace  = (now_ms < s_grace_until);
@@ -631,8 +680,10 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
          * FAILED 后再掉一次（reason 8）不加这个判断就会插一次多余的 connect，
          * 和退避重连撞在一起。 */
         bool switching = (s_state == NET_WIFI_CONNECTING) || in_grace;
+        net_wifi_err_t kind = reason_kind(r);
 
-        if (switching && (leaving || s_soft_retry < 1)) {
+        if (switching && kind != NET_WIFI_ERR_PASSWORD &&
+            (leaving || s_soft_retry < 1)) {
             if (!leaving) {
                 s_soft_retry++;
             }
@@ -644,13 +695,34 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 
         /* reason 常见值：15 = 4WAY_HANDSHAKE_TIMEOUT（密码错），
          * 201 = NO_AP_FOUND（信号没了/关路由），205 = 关联被拒 */
-        ESP_LOGW(TAG, "断开（reason=%d，%s），准备重试", r, disc_hint(r));
-        s_fail_reason = reason_kind(r);
+        ESP_LOGW(TAG, "断开（reason=%d，%s）", r, disc_hint(r));
+        s_fail_reason = kind;
         set_state(NET_WIFI_FAILED);
+
+        /* 密码/加密不匹配是**确定性**失败：再下发同一份密码 100 次也是同样的
+         * 结果，只会把界面钉在"正在重试…"上（用户反馈的正是这种"一直尝试"）。
+         * 直接把重试预算判为用尽 —— 界面据此显示"密码错误，已停止重试"，
+         * 状态停在 FAILED 等人处理；用户重新输密码 / 点选网络会清掉这个标志
+         * 再给一整轮预算（见 apply_cfg）。 */
+        if (s_fail_reason == NET_WIFI_ERR_PASSWORD) {
+            s_retry_stop = true;
+            ESP_LOGE(TAG, "密码/加密方式不匹配（reason=%d），不自动重试"
+                          "（重新输入密码或点选网络可再来一轮）", r);
+        } else {
+            ESP_LOGI(TAG, "转入退避重连（最多 %d 次）", RETRY_MAX_TIMES);
+        }
         break;
     }
 
     case WIFI_EVENT_SCAN_DONE:
+        /* 一轮只认第一个 SCAN_DONE：重复事件已经取不到结果（见
+         * s_scan_done_seen 的注释），再调 scan_collect() 只会把刚发布的
+         * 列表清成 0 条。这里连 scan_collect 都不进，避免任何副作用。 */
+        if (s_scan_done_seen) {
+            ESP_LOGI(TAG, "重复的 SCAN_DONE（本轮已收过结果），忽略");
+            break;
+        }
+        s_scan_done_seen = true;
         scan_collect();
         s_scanning = false;
         s_scan_fail = 0;
@@ -675,6 +747,9 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
     snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
     s_retry      = 0;
     s_retry_stop = false;       /* 连上了，下一轮故障重新给满 3 次 */
+    /* 拿到 IP 才算这组凭据真的可用：从现在起 cfg_save() 才允许把它写进
+     * KEY_SSID/KEY_PASS 当"开机自动连的目标"（见 cfg_save 的注释）。 */
+    s_target_ok  = true;
     set_state(NET_WIFI_CONNECTED);
     ESP_LOGI(TAG, "已连接 \"%s\"，IP %s", s_ssid, s_ip);
 }
@@ -759,7 +834,12 @@ static esp_err_t push_cfg_and_connect(void)
     /* 开一个重配窗口：此后 3 s 内来的 DISCONNECTED 多半是 driver 自己
      * 离开旧链路造成的，不该算连接失败（见 CONN_GRACE_MS）。 */
     s_grace_until = esp_timer_get_time() / 1000 + CONN_GRACE_MS;
-    s_soft_retry  = 0;
+    /* **这里绝不能清 s_soft_retry。** 旧代码在这清了一次，于是"立即重连只给
+     * 1 次"的闸门每次重连都被重新打开：CONNECTING 状态下的任何断开都走
+     * "切换过程、立即重连"，永远进不了 FAILED，重试预算（RETRY_MAX_TIMES）
+     * 也就永远用不上 —— 现场日志的表现是每 3.5 s 一条"立即重连（重新下发配置）"
+     * 无限循环，密码错的网络能一直转下去。
+     * 清零只属于"用户动作发起的新一轮"（见 apply_cfg）。 */
     s_conn_since  = esp_timer_get_time() / 1000;
 
     /* connect 不在这里发，交给任务延迟 CONNECT_DELAY_MS 再发。
@@ -815,6 +895,9 @@ static esp_err_t apply_cfg(void)
     s_imm_retry = false;
     s_imm_try   = 0;
     s_connect_fail = 0;
+    /* "立即重连"的额度也只在这里给满（见 push_cfg_and_connect 的注释）：
+     * 一次用户动作 → 可以吃一次切网尾巴；再断就是真失败。 */
+    s_soft_retry = 0;
     set_state(NET_WIFI_CONNECTING);
 
     esp_err_t err = push_cfg_and_connect();
@@ -823,6 +906,58 @@ static esp_err_t apply_cfg(void)
         s_imm_try   = 0;
     }
     return err;
+}
+
+/* 自动连接时挑目标：从本轮扫描结果里选"已保存 + 信号最强"的那个。
+ *
+ * 不再沿用"上次连的那一个"的理由：现场同时存在多个 SSID（调试台、客户现场、
+ * 手机热点），上次那个可能已经不在范围里，甚至是从旧固件带过来的脏数据。
+ * 盯着它白试 3 轮（每轮最长 20 s 超时）才轮到别人，界面看起来就是
+ * "开机半天连不上"。而 s_sv 表里的每一条都是**真的连成功过**的凭据，
+ * 从里面挑信号最强的，命中率最高。
+ *
+ * 只认表里有的网络：扫到一堆没密码的新 SSID 也不能乱选。
+ * 一个已知网络都不在附近时返回 false，仍按原目标试（可能只是扫描没抓到）。
+ *
+ * **只在自动补连路径调用**：用户点选网络走 s_conn_pending，不能被他没选的
+ * 那个"更强的"顶掉。
+ *
+ * 返回 true 表示目标已经换掉。 */
+static bool pick_saved_target(void)
+{
+    if (s_ap_n <= 0) {
+        return false;               /* 这一轮没扫到东西：保持原目标 */
+    }
+
+    int best = -1;
+    for (int i = 0; i < s_ap_n; i++) {
+        if (!s_aps[i].saved || saved_find(s_aps[i].ssid) < 0) {
+            continue;               /* 只认"表里有密码"的（saved 标记 + 表双保险） */
+        }
+        if (best < 0 || s_aps[i].rssi > s_aps[best].rssi) {
+            best = i;
+        }
+    }
+    if (best < 0) {
+        return false;
+    }
+    if (strncmp(s_aps[best].ssid, s_ssid, NET_WIFI_SSID_MAX - 1) == 0) {
+        return false;               /* 最强的就是原来那个，不用动 */
+    }
+
+    int si = saved_find(s_aps[best].ssid);
+
+    ESP_LOGI(TAG, "自动选网：已知网络里 \"%s\" 最强（%d dBm），改连它（原目标 \"%s\"）",
+             s_aps[best].ssid, (int)s_aps[best].rssi, s_ssid[0] ? s_ssid : "（无）");
+
+    strncpy(s_ssid, s_aps[best].ssid, NET_WIFI_SSID_MAX - 1);
+    s_ssid[NET_WIFI_SSID_MAX - 1] = '\0';
+    strncpy(s_pass, s_sv_pass[si], NET_WIFI_PASS_MAX - 1);
+    s_pass[NET_WIFI_PASS_MAX - 1] = '\0';
+
+    s_have_cfg  = true;
+    s_target_ok = true;             /* 进过表的密码 = 验证过的 */
+    return true;
 }
 
 static void wifi_task(void *arg)
@@ -918,21 +1053,30 @@ static void wifi_task(void *arg)
     }
 
     /* STA_START 事件里已经把 s_driver_up 置位、状态切到 CONNECTING/IDLE。
-     * 这里主动补一次连接：事件可能先于本行到达，也可能因为 C6 侧时序晚到。
-     * 但只要有挂起的扫描（开机预扫 / 用户刚拨开开关），就先扫再连 ——
-     * 先连的话状态马上变 CONNECTING，补扫就得等连接结果，连接一卡壳
-     * 界面就是"一直扫描中、列表全空"（见 net_wifi_set_enabled 的注释）。 */
-    s_want = s_have_cfg;
-    if (s_want && !s_scan_wanted) {
-        apply_cfg();
-    } else {
-        set_state(NET_WIFI_IDLE);
+     *
+     * 开机也走"先扫再连"：目标要从"已知网络里信号最强的"里挑
+     * （见 pick_saved_target），不扫就没法比信号。
+     *
+     * 老写法是 `s_want = s_have_cfg; apply_cfg();` —— 直接信任 NVS 里那一个
+     * SSID，不扫描、不看信号。单网络时代没问题，现在现场有多个 SSID 时就成了
+     * "开机先对着一个不在附近（甚至密码已经错了）的网络空等 20 s"。
+     * 多花 1~2 s 扫描，换掉这 20 s 和之后一串重连日志。
+     *
+     * 扫描请求交给下面的守护循环补发：此刻 STA_START 可能还没到。
+     * s_want 也接受"表里有网络但 NVS 目标为空"的情形。 */
+    s_want = (s_have_cfg || s_sv_n > 0);
+    if (s_want) {
+        s_scan_wanted = true;
+        s_scan_defer_logged = false;
     }
+    set_state(NET_WIFI_IDLE);
 
     /* ---- 2) 守护循环 ---- */
     int64_t next_rssi = 0;
     int64_t retry_at  = 0;
     int     link_miss = 0;      /* 已连接状态下"探活失败"的连续次数 */
+    bool    hold_armed = false; /* 失败原因正在"倒计时显示"（见 FAIL_HOLD_MS） */
+    int64_t hold_at    = 0;
     int64_t last_tick = esp_timer_get_time() / 1000;
 
     while (true) {
@@ -1057,13 +1201,20 @@ static void wifi_task(void *arg)
         }
 
         /* 扫描结束后，把"先扫再连"推迟掉的连接补上：
-         * 条件是"空闲 + 期望连接 + 有凭据 + 没有在扫/待扫"。
-         * 断开/忘记密码时 s_want 或 s_have_cfg 已经为假，不会误连。
+         * 条件是"空闲 + 期望连接 + 没有在扫/待扫"。
+         * 断开/忘记密码时 s_want 已经为假，不会误连。
          * FAILED 不在这里处理：那种情况要走下面的退避重连，否则会变成
-         * 每秒一次的紧密重连风暴。 */
-        if (s_want && s_have_cfg && s_state == NET_WIFI_IDLE &&
+         * 每秒一次的紧密重连风暴。
+         *
+         * 正式下发之前先按信号挑一次目标（pick_saved_target）：
+         * 这里涵盖开机首连、拨开关、扫描结束三种"自动连"场景。用户点选
+         * 网络走上面的 s_conn_pending，不经过这里，不会被"更强的"顶掉。 */
+        if (s_want && s_state == NET_WIFI_IDLE &&
             !s_scanning && !s_scan_wanted) {
-            apply_cfg();
+            (void)pick_saved_target();
+            if (s_have_cfg) {
+                apply_cfg();
+            }
         }
 
         /* 重连退避：2 s 起步，每次 +2 s，**最多 RETRY_MAX_TIMES 次**。
@@ -1094,6 +1245,34 @@ static void wifi_task(void *arg)
                          s_retry, RETRY_MAX_TIMES, delay);
                 push_cfg_and_connect();
             }
+        }
+
+        /* 失败原因显示 FAIL_HOLD_MS 之后自动回到"未连接"。
+         *
+         * 用户要的行为：密码错 / AP 不在这类失败，看完原因就该恢复成一个
+         * 干净的空闲态，而不是长期钉在 FAILED 上等人来按"断开"。
+         *
+         * 两个条件缺一不可：
+         *   s_retry_stop —— 只有"确定不会再自动重试"才收摊；退避重连期间
+         *                   FAILED 是过渡态，提前回 IDLE 会打断退避节奏。
+         *   s_want=false —— 否则回到 IDLE 的下一拍就命中前面的"扫后补连"
+         *                   （s_want && s_have_cfg && IDLE），立刻又连一次，
+         *                   变成"失败→重置→再连"的循环，正是要消灭的那种。
+         * 扫描不碰 s_want，所以回 IDLE 后点"扫描"不会把它悄悄拉起来；
+         * 只有用户点网络（net_wifi_connect → apply_cfg）或拨开关才会重新置真。 */
+        if (s_state == NET_WIFI_FAILED && s_retry_stop) {
+            if (!hold_armed) {
+                hold_armed = true;
+                hold_at    = now;
+            } else if (now - hold_at >= FAIL_HOLD_MS) {
+                hold_armed = false;
+                s_want = false;
+                ESP_LOGI(TAG, "失败原因已显示 %d s，回到未连接（点网络或拨开关可再来一轮）",
+                         FAIL_HOLD_MS / 1000);
+                set_state(s_enabled ? NET_WIFI_IDLE : NET_WIFI_OFF);
+            }
+        } else {
+            hold_armed = false;
         }
 
         /* 已连接时定期刷信号强度：esp_wifi_sta_get_ap_info 是 RPC 调用，
@@ -1293,7 +1472,7 @@ esp_err_t net_wifi_set_enabled(bool on)
      *
      * 现在置 IDLE 让任务先扫一轮（1~2 s 就有列表），扫完由任务里的
      * "扫后补连"用 s_want 把连接接回去。 */
-    s_want = s_have_cfg;
+    s_want = (s_have_cfg || s_sv_n > 0);
     set_state(NET_WIFI_IDLE);
     return ESP_OK;
 }
@@ -1319,6 +1498,7 @@ esp_err_t net_wifi_scan_start(void)
 
     s_scan_wanted = false;
     s_scanning = true;
+    s_scan_done_seen = false;       /* 新一轮：允许收第一个 SCAN_DONE */
     s_scan_since = esp_timer_get_time() / 1000;
     wifi_scan_config_t sc;
     memset(&sc, 0, sizeof(sc));
@@ -1426,6 +1606,9 @@ esp_err_t net_wifi_connect(const char *ssid, const char *pass, bool save)
         s_pass[NET_WIFI_PASS_MAX - 1] = '\0';
     }
     s_have_cfg = true;
+    /* 这组凭据还没验证过：连上拿到 IP 之前，cfg_save() 不许拿它覆盖
+     * NVS 里的开机目标（见 s_target_ok 的注释）。 */
+    s_target_ok = false;
 
     /* 先不写"已知网络"表：这次还没连上。
      *
